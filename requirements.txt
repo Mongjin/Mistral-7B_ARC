@@ -1,0 +1,14 @@
+# Install PyTorch first with install.sh so the CUDA wheel matches the server.
+accelerate>=1.2.0,<2.0.0
+bitsandbytes>=0.45.0,<0.50.0
+datasets>=3.0.0,<5.0.0
+huggingface_hub>=0.27.0,<1.0.0
+Jinja2>=3.1.0,<4.0.0
+lm-eval>=0.4.6,<0.5.0
+peft>=0.14.0,<0.18.0
+protobuf>=4.25.0,<6.0.0
+safetensors>=0.4.0,<1.0.0
+scipy>=1.11.0,<2.0.0
+sentencepiece>=0.2.0,<1.0.0
+transformers>=4.48.0,<5.0.0
+trl>=0.15.0,<0.25.0
