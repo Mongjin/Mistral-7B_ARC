@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--dataset-id", default=DEFAULT_DATASET_ID)
     parser.add_argument("--dataset-split", default="train")
-    parser.add_argument("--cache-dir", type=Path, default=Path(os.environ.get("HF_HOME", "/home/mongjin/tmp/huggingface_cache")))
+    parser.add_argument("--cache-dir", type=Path, default="/home/mongjin/tmp/huggingface_cache")
     parser.add_argument("--base-local-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--merged-output-dir", type=Path, default=None)
