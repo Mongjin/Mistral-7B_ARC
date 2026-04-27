@@ -82,6 +82,16 @@ python run_mistral_arc_experiment.py \
   --merged-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train
 ```
 
+To train ARC with every answer choice shown before `Answer:`:
+
+```bash
+python run_mistral_arc_experiment.py \
+  --cache-dir /tmp/huggingface_cache \
+  --train-dataset arc \
+  --arc-format question_choices_answer \
+  --merged-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-choices
+```
+
 To mix the original 500 Alpaca samples with all ARC train examples:
 
 ```bash
@@ -96,7 +106,8 @@ ARC options:
 - `--arc-configs ARC-Easy ARC-Challenge` controls which ARC subsets are loaded.
 - `--arc-split train` controls the ARC split.
 - `--arc-sample-size 0` means use all combined ARC examples. Set a positive number to sample after combining and shuffling.
-- ARC examples are formatted as `Question: ...\nAnswer:` with the correct answer choice text as the target, matching the `lm_eval` ARC multiple-choice setup.
+- `--arc-format question_answer` keeps the original format: `{question} Answer: {answer_text}`.
+- `--arc-format question_choices_answer` uses `{question}\nChoices:\nA. ...\nB. ...\nAnswer: {answer_text}`.
 
 To evaluate the original Mistral-7B baseline instead of the fine-tuned model:
 

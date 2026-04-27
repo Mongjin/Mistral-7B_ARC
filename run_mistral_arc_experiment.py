@@ -50,6 +50,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arc-configs", nargs="+", default=["ARC-Easy", "ARC-Challenge"])
     parser.add_argument("--arc-split", default="train")
     parser.add_argument(
+        "--arc-format",
+        choices=["question_answer", "question_choices_answer"],
+        default="question_answer",
+        help="ARC SFT prompt format. Use question_choices_answer to include all answer choices before Answer:",
+    )
+    parser.add_argument(
         "--arc-sample-size",
         type=int,
         default=0,
@@ -273,13 +279,19 @@ def format_alpaca_example(example: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def format_arc_example(example: dict[str, Any]) -> dict[str, str]:
+def format_arc_example(example: dict[str, Any], arc_format: str = "question_answer") -> dict[str, str]:
     choices = example["choices"]
     labels = [str(label) for label in choices["label"]]
     texts = [str(text) for text in choices["text"]]
     answer = str(example["answerKey"])
     answer_text = texts[labels.index(answer)] if answer in labels else answer
-    prompt = f"{example['question']} Answer: "
+
+    if arc_format == "question_choices_answer":
+        formatted_choices = " ".join(f"{label}. {choice_text}" for label, choice_text in zip(labels, texts))
+        prompt = f"{example['question']} Choices: {formatted_choices} Answer: "
+    else:
+        prompt = f"{example['question']} Answer: "
+
     text = f"<s>{prompt}{answer_text}</s>"
     return {
         "instruction": "",
@@ -321,7 +333,7 @@ def load_arc_training_dataset(args: argparse.Namespace):
             split=args.arc_split,
             cache_dir=str(args.cache_dir),
         )
-        dataset = dataset.map(format_arc_example).select_columns(TRAIN_COLUMNS)
+        dataset = dataset.map(format_arc_example, fn_kwargs={"arc_format": args.arc_format}).select_columns(TRAIN_COLUMNS)
         dataset = dataset.remove_columns("source").add_column("source", [config] * len(dataset))
         arc_datasets.append(dataset)
         print(f"Loaded {len(dataset)} examples from {args.arc_dataset_id}/{config}/{args.arc_split}.")
