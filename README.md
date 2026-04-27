@@ -93,10 +93,15 @@ To evaluate only the unfine-tuned baseline:
 
 ```bash
 python run_mistral_arc_experiment.py \
+  --cache-dir /tmp/huggingface_cache \
   --eval-only \
-  --eval-baseline \
-  --baseline-eval-model-id mistralai/Mistral-7B-v0.1
+  --eval-baseline
 ```
+
+If `/tmp/huggingface_cache/mistralai/Mistral-7B-v0.1` already exists, the script
+loads the baseline from that local path instead of downloading it again. Use
+`--base-local-dir` or `--baseline-eval-model-id` only when the local model lives
+somewhere else.
 
 If `lm_eval` fails with an error such as
 `MistralForCausalLM.__init__() got an unexpected keyword argument 'dtype'`,

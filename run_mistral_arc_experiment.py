@@ -157,6 +157,10 @@ def get_default_output_dir(args: argparse.Namespace) -> Path:
     return args.output_dir or (args.cache_dir / "results")
 
 
+def get_base_local_dir(args: argparse.Namespace) -> Path:
+    return args.base_local_dir or (args.cache_dir / args.model_id)
+
+
 def get_default_merged_output_dir(args: argparse.Namespace) -> Path:
     if args.merged_output_dir:
         return args.merged_output_dir
@@ -166,10 +170,14 @@ def get_default_merged_output_dir(args: argparse.Namespace) -> Path:
 
 
 def download_model_repo(args: argparse.Namespace) -> str:
+    local_dir = get_base_local_dir(args)
+    if local_dir.exists():
+        print(f"Using existing local base model repository: {local_dir}")
+        return str(local_dir)
+
     if not args.download_base:
         return args.model_id
 
-    local_dir = args.base_local_dir or (args.cache_dir / args.model_id)
     local_dir.parent.mkdir(parents=True, exist_ok=True)
     repo_path = snapshot_download(
         repo_id=args.model_id,
@@ -451,8 +459,11 @@ def resolve_baseline_eval_model(args: argparse.Namespace, base_model_path: str |
         return args.baseline_eval_model_id
     if base_model_path:
         return base_model_path
-    if args.base_local_dir and args.base_local_dir.exists():
-        return str(args.base_local_dir)
+
+    local_dir = get_base_local_dir(args)
+    if local_dir.exists():
+        return str(local_dir)
+
     return args.model_id
 
 
