@@ -569,9 +569,33 @@ def get_checkpoint_epoch(checkpoint_dir: Path) -> float | None:
     return float(epoch) if epoch is not None else None
 
 
+def clean_model_output_dir(output_dir: Path) -> None:
+    """Remove stale model artifacts before save_pretrained writes a new model."""
+    patterns = [
+        "*.safetensors",
+        "*.bin",
+        "*.index.json",
+        "config.json",
+        "generation_config.json",
+        "model.safetensors.index.json",
+        "pytorch_model.bin.index.json",
+        "tokenizer.json",
+        "tokenizer.model",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "adapter_config.json",
+    ]
+    for pattern in patterns:
+        for path in output_dir.glob(pattern):
+            if path.is_file():
+                path.unlink()
+
+
 def save_merged_model_and_tokenizer(args: argparse.Namespace, merged_model, tokenizer) -> Path:
     merged_output_dir = get_default_merged_output_dir(args)
     merged_output_dir.mkdir(parents=True, exist_ok=True)
+    clean_model_output_dir(merged_output_dir)
     merged_model.save_pretrained(str(merged_output_dir), safe_serialization=True)
     tokenizer.save_pretrained(str(merged_output_dir))
     print(f"Merged model saved to: {merged_output_dir}")
