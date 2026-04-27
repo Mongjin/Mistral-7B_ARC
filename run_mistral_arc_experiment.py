@@ -85,7 +85,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-fewshot", type=int, default=25)
     parser.add_argument("--eval-batch-size", default="8")
     parser.add_argument("--eval-device", default="cuda:0")
-    parser.add_argument("--eval-dtype", default="float16")
+    parser.add_argument(
+        "--eval-dtype",
+        default="float16",
+        help="dtype passed to lm_eval hf model_args. Use 'none' to omit it for compatibility.",
+    )
 
     args = parser.parse_args()
     args.cache_dir = args.cache_dir.expanduser().resolve()
@@ -436,7 +440,10 @@ def run_eval(args: argparse.Namespace, merged_output_dir: Path | None) -> None:
         output_path = args.cache_dir / "results" / "arc_challenge" / f"result-{args.num_fewshot}shot.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    model_args = f"pretrained={eval_model},trust_remote_code=True,dtype={args.eval_dtype}"
+    model_arg_parts = [f"pretrained={eval_model}", "trust_remote_code=True"]
+    if args.eval_dtype.lower() not in {"none", "null", "off"}:
+        model_arg_parts.append(f"dtype={args.eval_dtype}")
+    model_args = ",".join(model_arg_parts)
     lm_eval_bin = shutil.which("lm_eval")
     if lm_eval_bin:
         cmd = [lm_eval_bin]

@@ -76,6 +76,17 @@ python run_mistral_arc_experiment.py \
   --eval-model-id /tmp/huggingface_cache/mistral-7b-qlora-alpaca-sample-0.5k
 ```
 
+If `lm_eval` fails with an error such as
+`MistralForCausalLM.__init__() got an unexpected keyword argument 'dtype'`,
+omit the evaluation dtype argument:
+
+```bash
+python run_mistral_arc_experiment.py \
+  --eval-only \
+  --eval-model-id /tmp/huggingface_cache/mistral-7b-qlora-alpaca-sample-0.5k \
+  --eval-dtype none
+```
+
 ## Optional Hub push
 
 Pushing is disabled by default to avoid accidental uploads. To push the merged
