@@ -263,7 +263,7 @@ def format_alpaca_example(example: dict[str, Any]) -> dict[str, str]:
     instruction = example["instruction"]
     input_text = example["input"]
     output = example["output"]
-    text = f"<s>[INST] {instruction} here are the inputs {input_text} [/INST] \n {output} </s>"
+    text = f"<s> {instruction} here are the inputs {input_text} \n {output} </s>"
     return {
         "instruction": instruction,
         "input": input_text,
