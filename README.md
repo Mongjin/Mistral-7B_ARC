@@ -6,8 +6,9 @@ notebook experiment in `Mistal-7B_ARC.ipynb`.
 Default experiment:
 
 - Base model: `mistralai/Mistral-7B-v0.1`
-- Dataset: `tatsu-lab/alpaca`, `train` split
+- Dataset: `tatsu-lab/alpaca`, `train` split by default
 - Sampling: 500 examples after `shuffle(seed=42)`
+- Optional ARC training data: `allenai/ai2_arc`, `ARC-Easy/train` plus `ARC-Challenge/train`
 - Fine-tuning: QLoRA, `r=8`, `lora_alpha=16`, `target_modules=["q_proj", "v_proj"]`
 - Training: 1 epoch, batch size 4, learning rate `2e-4`, max length 1024
 - Precision: auto bf16 on supported GPUs such as A100, otherwise fp16
@@ -53,6 +54,31 @@ python run_mistral_arc_experiment.py \
 
 The script trains the LoRA adapter, merges it into the base model, saves the
 merged model, clears GPU memory, and then runs ARC Challenge evaluation.
+
+To train on ARC Easy and ARC Challenge train examples instead of Alpaca:
+
+```bash
+python run_mistral_arc_experiment.py \
+  --cache-dir /tmp/huggingface_cache \
+  --train-dataset arc \
+  --merged-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train
+```
+
+To mix the original 500 Alpaca samples with all ARC train examples:
+
+```bash
+python run_mistral_arc_experiment.py \
+  --cache-dir /tmp/huggingface_cache \
+  --train-dataset alpaca_arc \
+  --merged-output-dir /tmp/huggingface_cache/mistral-7b-qlora-alpaca-arc
+```
+
+ARC options:
+
+- `--arc-configs ARC-Easy ARC-Challenge` controls which ARC subsets are loaded.
+- `--arc-split train` controls the ARC split.
+- `--arc-sample-size 0` means use all combined ARC examples. Set a positive number to sample after combining and shuffling.
+- ARC examples are formatted as `Question: ...\nAnswer:` with the correct answer choice text as the target, matching the `lm_eval` ARC multiple-choice setup.
 
 To evaluate the original Mistral-7B baseline instead of the fine-tuned model:
 

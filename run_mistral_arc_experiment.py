@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from datasets import load_dataset
+from datasets import concatenate_datasets, load_dataset
 from huggingface_hub import login, snapshot_download
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, set_seed
@@ -21,7 +21,9 @@ from trl import SFTConfig, SFTTrainer
 
 DEFAULT_MODEL_ID = "mistralai/Mistral-7B-v0.1"
 DEFAULT_DATASET_ID = "tatsu-lab/alpaca"
+DEFAULT_ARC_DATASET_ID = "allenai/ai2_arc"
 DEFAULT_MODEL_NAME = "mistral-7b-qlora-alpaca-sample-0.5k"
+TRAIN_COLUMNS = ["instruction", "input", "output", "text", "source"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,9 +35,24 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    parser.add_argument(
+        "--train-dataset",
+        choices=["alpaca", "arc", "alpaca_arc"],
+        default="alpaca",
+        help="Training data source. 'arc' uses AI2 ARC-Easy and ARC-Challenge train splits.",
+    )
     parser.add_argument("--dataset-id", default=DEFAULT_DATASET_ID)
     parser.add_argument("--dataset-split", default="train")
-    parser.add_argument("--cache-dir", type=Path, default="/home/mongjin/tmp/huggingface_cache")
+    parser.add_argument("--arc-dataset-id", default=DEFAULT_ARC_DATASET_ID)
+    parser.add_argument("--arc-configs", nargs="+", default=["ARC-Easy", "ARC-Challenge"])
+    parser.add_argument("--arc-split", default="train")
+    parser.add_argument(
+        "--arc-sample-size",
+        type=int,
+        default=0,
+        help="Number of combined ARC examples to use. Use 0 or a negative value for all ARC train examples.",
+    )
+    parser.add_argument("--cache-dir", type=Path, default=Path("/home/mongjin/tmp/huggingface_cache"))
     parser.add_argument("--base-local-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--merged-output-dir", type=Path, default=None)
@@ -198,6 +215,10 @@ def get_default_merged_output_dir(args: argparse.Namespace) -> Path:
         return args.merged_output_dir
     if args.hub_model_id:
         return args.cache_dir / args.hub_model_id
+    if args.train_dataset == "arc":
+        return args.cache_dir / "mistral-7b-qlora-arc-train"
+    if args.train_dataset == "alpaca_arc":
+        return args.cache_dir / "mistral-7b-qlora-alpaca-arc"
     return args.cache_dir / DEFAULT_MODEL_NAME
 
 
@@ -232,21 +253,80 @@ def format_alpaca_example(example: dict[str, Any]) -> dict[str, str]:
         "input": input_text,
         "output": output,
         "text": text,
+        "source": "alpaca",
     }
 
 
-def load_training_dataset(args: argparse.Namespace):
+def format_arc_example(example: dict[str, Any]) -> dict[str, str]:
+    choices = example["choices"]
+    labels = [str(label) for label in choices["label"]]
+    texts = [str(text) for text in choices["text"]]
+    answer = str(example["answerKey"])
+    answer_text = texts[labels.index(answer)] if answer in labels else answer
+    prompt = f"Question: {example['question']}\nAnswer:"
+    text = f"<s>[INST] {prompt} [/INST]\n{answer_text}</s>"
+    return {
+        "instruction": "Answer the science question.",
+        "input": prompt,
+        "output": answer_text,
+        "text": text,
+        "source": "arc",
+    }
+
+
+def sample_dataset(dataset, sample_size: int, seed: int, label: str):
+    dataset = dataset.shuffle(seed=seed)
+    if sample_size <= 0:
+        print(f"Using all {len(dataset)} {label} examples.")
+        return dataset
+
+    actual_size = min(sample_size, len(dataset))
+    if actual_size != sample_size:
+        print(f"Requested {sample_size} {label} examples, but dataset has {len(dataset)} rows. Using {actual_size}.")
+    return dataset.select(range(actual_size))
+
+
+def load_alpaca_training_dataset(args: argparse.Namespace):
     dataset = load_dataset(
         args.dataset_id,
         split=args.dataset_split,
         cache_dir=str(args.cache_dir),
     )
-    sample_size = min(args.sample_size, len(dataset))
-    if sample_size != args.sample_size:
-        print(f"Requested {args.sample_size} samples, but dataset has {len(dataset)} rows. Using {sample_size}.")
+    dataset = sample_dataset(dataset, args.sample_size, args.seed, "Alpaca")
+    return dataset.map(format_alpaca_example).select_columns(TRAIN_COLUMNS)
 
-    dataset = dataset.shuffle(seed=args.seed).select(range(sample_size))
-    dataset = dataset.map(format_alpaca_example)
+
+def load_arc_training_dataset(args: argparse.Namespace):
+    arc_datasets = []
+    for config in args.arc_configs:
+        dataset = load_dataset(
+            args.arc_dataset_id,
+            config,
+            split=args.arc_split,
+            cache_dir=str(args.cache_dir),
+        )
+        dataset = dataset.map(format_arc_example).select_columns(TRAIN_COLUMNS)
+        dataset = dataset.remove_columns("source").add_column("source", [config] * len(dataset))
+        arc_datasets.append(dataset)
+        print(f"Loaded {len(dataset)} examples from {args.arc_dataset_id}/{config}/{args.arc_split}.")
+
+    dataset = concatenate_datasets(arc_datasets)
+    dataset = sample_dataset(dataset, args.arc_sample_size, args.seed, "ARC")
+    return dataset
+
+
+def load_training_dataset(args: argparse.Namespace):
+    datasets = []
+    if args.train_dataset in {"alpaca", "alpaca_arc"}:
+        datasets.append(load_alpaca_training_dataset(args))
+    if args.train_dataset in {"arc", "alpaca_arc"}:
+        datasets.append(load_arc_training_dataset(args))
+
+    if len(datasets) == 1:
+        dataset = datasets[0]
+    else:
+        dataset = concatenate_datasets(datasets).shuffle(seed=args.seed)
+
     print(dataset)
     print("First formatted sample:")
     print(dataset[0]["text"])
