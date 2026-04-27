@@ -282,7 +282,7 @@ def format_arc_example(example: dict[str, Any]) -> dict[str, str]:
     prompt = f"Question: {example['question']}\nAnswer:"
     text = f"<s> {prompt} \n {answer_text} </s>"
     return {
-        "instruction": "Answer the science question.",
+        "instruction": "",
         "input": prompt,
         "output": answer_text,
         "text": text,
