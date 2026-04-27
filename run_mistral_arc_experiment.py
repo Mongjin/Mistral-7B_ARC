@@ -161,6 +161,34 @@ def get_base_local_dir(args: argparse.Namespace) -> Path:
     return args.base_local_dir or (args.cache_dir / args.model_id)
 
 
+def looks_like_model_dir(path: Path) -> bool:
+    return path.is_dir() and (path / "config.json").exists()
+
+
+def get_hf_cache_snapshot_dir(args: argparse.Namespace) -> Path | None:
+    repo_cache_name = f"models--{args.model_id.replace('/', '--')}"
+    snapshot_roots = [
+        args.cache_dir / repo_cache_name / "snapshots",
+        args.cache_dir / "hub" / repo_cache_name / "snapshots",
+    ]
+
+    candidates: list[Path] = []
+    for snapshot_root in snapshot_roots:
+        if snapshot_root.exists():
+            candidates.extend(path for path in snapshot_root.iterdir() if looks_like_model_dir(path))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def resolve_cached_base_model_path(args: argparse.Namespace) -> Path | None:
+    local_dir = get_base_local_dir(args)
+    if looks_like_model_dir(local_dir):
+        return local_dir
+    return get_hf_cache_snapshot_dir(args)
+
+
 def get_default_merged_output_dir(args: argparse.Namespace) -> Path:
     if args.merged_output_dir:
         return args.merged_output_dir
@@ -170,14 +198,15 @@ def get_default_merged_output_dir(args: argparse.Namespace) -> Path:
 
 
 def download_model_repo(args: argparse.Namespace) -> str:
-    local_dir = get_base_local_dir(args)
-    if local_dir.exists():
-        print(f"Using existing local base model repository: {local_dir}")
-        return str(local_dir)
+    cached_model_path = resolve_cached_base_model_path(args)
+    if cached_model_path:
+        print(f"Using existing local base model repository: {cached_model_path}")
+        return str(cached_model_path)
 
     if not args.download_base:
         return args.model_id
 
+    local_dir = get_base_local_dir(args)
     local_dir.parent.mkdir(parents=True, exist_ok=True)
     repo_path = snapshot_download(
         repo_id=args.model_id,
@@ -460,11 +489,16 @@ def resolve_baseline_eval_model(args: argparse.Namespace, base_model_path: str |
     if base_model_path:
         return base_model_path
 
-    local_dir = get_base_local_dir(args)
-    if local_dir.exists():
-        return str(local_dir)
+    cached_model_path = resolve_cached_base_model_path(args)
+    if cached_model_path:
+        return str(cached_model_path)
 
-    return args.model_id
+    expected_local_dir = get_base_local_dir(args)
+    raise ValueError(
+        "Baseline evaluation was requested, but no local base model was found. "
+        f"Expected either {expected_local_dir} or a Hugging Face snapshot cache under {args.cache_dir}. "
+        "Pass --baseline-eval-model-id with the exact local model directory if it lives elsewhere."
+    )
 
 
 def get_eval_output_path(args: argparse.Namespace, label: str) -> Path:
