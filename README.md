@@ -54,6 +54,19 @@ python run_mistral_arc_experiment.py \
 The script trains the LoRA adapter, merges it into the base model, saves the
 merged model, clears GPU memory, and then runs ARC Challenge evaluation.
 
+To evaluate the original Mistral-7B baseline instead of the fine-tuned model:
+
+```bash
+python run_mistral_arc_experiment.py \
+  --cache-dir /tmp/huggingface_cache \
+  --merged-output-dir /tmp/huggingface_cache/mistral-7b-qlora-alpaca-sample-0.5k \
+  --eval-baseline
+```
+
+Each script run executes exactly one evaluation. Without `--eval-baseline`, the
+script evaluates the fine-tuned model. With `--eval-baseline`, it evaluates the
+base model and writes `baseline-result-25shot.json` by default.
+
 To use FlashAttention after installing it:
 
 ```bash
@@ -74,6 +87,15 @@ To evaluate an already saved local model or Hugging Face model:
 python run_mistral_arc_experiment.py \
   --eval-only \
   --eval-model-id /tmp/huggingface_cache/mistral-7b-qlora-alpaca-sample-0.5k
+```
+
+To evaluate only the unfine-tuned baseline:
+
+```bash
+python run_mistral_arc_experiment.py \
+  --eval-only \
+  --eval-baseline \
+  --baseline-eval-model-id mistralai/Mistral-7B-v0.1
 ```
 
 If `lm_eval` fails with an error such as

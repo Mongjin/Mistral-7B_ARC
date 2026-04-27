@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -78,6 +80,17 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--download-base", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--run-eval", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--eval-baseline",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Evaluate the base Mistral model instead of the fine-tuned model.",
+    )
+    parser.add_argument(
+        "--baseline-eval-model-id",
+        default=None,
+        help="Model id or local path for baseline evaluation. Defaults to the downloaded base model path when available.",
+    )
     parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--eval-model-id", default=None)
     parser.add_argument("--eval-output-path", type=Path, default=None)
@@ -379,7 +392,7 @@ def print_training_state(trainer: SFTTrainer) -> None:
     print(counter)
 
 
-def train_and_save(args: argparse.Namespace) -> Path:
+def train_and_save(args: argparse.Namespace) -> tuple[Path, str]:
     ensure_cuda()
     resolve_precision(args)
     set_seed(args.seed)
@@ -420,7 +433,7 @@ def train_and_save(args: argparse.Namespace) -> Path:
 
     del trainer, model, merged_model
     torch.cuda.empty_cache()
-    return merged_output_dir
+    return merged_output_dir, model_path
 
 
 def resolve_eval_model(args: argparse.Namespace, merged_output_dir: Path | None) -> str:
@@ -433,17 +446,40 @@ def resolve_eval_model(args: argparse.Namespace, merged_output_dir: Path | None)
     raise ValueError("--eval-only requires --eval-model-id.")
 
 
-def run_eval(args: argparse.Namespace, merged_output_dir: Path | None) -> None:
-    eval_model = resolve_eval_model(args, merged_output_dir)
-    output_path = args.eval_output_path
-    if output_path is None:
-        output_path = args.cache_dir / "results" / "arc_challenge" / f"result-{args.num_fewshot}shot.json"
+def resolve_baseline_eval_model(args: argparse.Namespace, base_model_path: str | None) -> str:
+    if args.baseline_eval_model_id:
+        return args.baseline_eval_model_id
+    if base_model_path:
+        return base_model_path
+    if args.base_local_dir and args.base_local_dir.exists():
+        return str(args.base_local_dir)
+    return args.model_id
+
+
+def get_eval_output_path(args: argparse.Namespace, label: str) -> Path:
+    if args.eval_output_path is None:
+        filename = f"result-{args.num_fewshot}shot.json"
+        if label != "finetuned":
+            filename = f"{label}-{filename}"
+        return args.cache_dir / "results" / args.eval_tasks / filename
+
+    return args.eval_output_path
+
+
+def make_lm_eval_model_args(args: argparse.Namespace, eval_model: str) -> str:
+    model_args: dict[str, Any] = {
+        "pretrained": str(eval_model),
+        "trust_remote_code": args.trust_remote_code,
+    }
+    if args.eval_dtype.lower() not in {"none", "null", "off"}:
+        model_args["dtype"] = args.eval_dtype
+    return json.dumps(model_args)
+
+
+def run_single_eval(args: argparse.Namespace, label: str, eval_model: str, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    model_arg_parts = [f"pretrained={eval_model}", "trust_remote_code=True"]
-    if args.eval_dtype.lower() not in {"none", "null", "off"}:
-        model_arg_parts.append(f"dtype={args.eval_dtype}")
-    model_args = ",".join(model_arg_parts)
+    model_args = make_lm_eval_model_args(args, eval_model)
     lm_eval_bin = shutil.which("lm_eval")
     if lm_eval_bin:
         cmd = [lm_eval_bin]
@@ -468,9 +504,25 @@ def run_eval(args: argparse.Namespace, merged_output_dir: Path | None) -> None:
             str(output_path),
         ]
     )
-    print("Running evaluation:")
-    print(" ".join(cmd))
+    print(f"Running {label} evaluation:")
+    print(shlex.join(cmd))
     subprocess.run(cmd, check=True)
+
+
+def run_eval(
+    args: argparse.Namespace,
+    merged_output_dir: Path | None,
+    base_model_path: str | None = None,
+) -> None:
+    if args.eval_baseline:
+        label = "baseline"
+        eval_model = resolve_baseline_eval_model(args, base_model_path)
+    else:
+        label = "finetuned"
+        eval_model = resolve_eval_model(args, merged_output_dir)
+
+    output_path = get_eval_output_path(args, label)
+    run_single_eval(args, label, eval_model, output_path)
 
 
 def main() -> None:
@@ -480,9 +532,9 @@ def main() -> None:
         run_eval(args, merged_output_dir=None)
         return
 
-    merged_output_dir = train_and_save(args)
+    merged_output_dir, base_model_path = train_and_save(args)
     if args.run_eval:
-        run_eval(args, merged_output_dir)
+        run_eval(args, merged_output_dir, base_model_path=base_model_path)
 
 
 if __name__ == "__main__":
