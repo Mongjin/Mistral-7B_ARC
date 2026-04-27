@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--baseline-eval-model-id",
-        default=None,
+        default="mistralai/Mistral-7B-v0.1",
         help="Model id or local path for baseline evaluation. Defaults to the downloaded base model path when available.",
     )
     parser.add_argument("--eval-only", action="store_true")
