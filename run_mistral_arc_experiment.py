@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import inspect
+import json
 import os
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -14,7 +17,7 @@ from typing import Any
 import torch
 from datasets import concatenate_datasets, load_dataset
 from huggingface_hub import login, snapshot_download
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, set_seed
 from trl import SFTConfig, SFTTrainer
 
@@ -71,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=0.001)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
+    parser.add_argument("--save-strategy", choices=["steps", "epoch", "no"], default="steps")
     parser.add_argument("--save-steps", type=int, default=50)
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--optim", default="paged_adamw_32bit")
@@ -95,6 +99,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--download-base", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--select-best-model",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save each epoch checkpoint, run zero-shot lm_eval, and merge/save the checkpoint with best metric.",
+    )
+    parser.add_argument("--best-eval-tasks", default="arc_challenge")
+    parser.add_argument("--best-eval-metric", default="acc_norm")
+    parser.add_argument("--best-eval-batch-size", default=None)
+    parser.add_argument("--best-eval-output-dir", type=Path, default=None)
     parser.add_argument("--run-eval", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--eval-baseline",
@@ -135,6 +149,8 @@ def parse_args() -> argparse.Namespace:
         args.merged_output_dir = args.merged_output_dir.expanduser().resolve()
     if args.eval_output_path is not None:
         args.eval_output_path = args.eval_output_path.expanduser().resolve()
+    if args.best_eval_output_dir is not None:
+        args.best_eval_output_dir = args.best_eval_output_dir.expanduser().resolve()
     return args
 
 
@@ -456,6 +472,7 @@ def make_sft_config(args: argparse.Namespace) -> SFTConfig:
         "per_device_train_batch_size": args.per_device_train_batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "optim": args.optim,
+        "save_strategy": "epoch" if args.select_best_model else args.save_strategy,
         "save_steps": args.save_steps,
         "logging_steps": args.logging_steps,
         "learning_rate": args.learning_rate,
@@ -513,26 +530,34 @@ def print_training_state(trainer: SFTTrainer) -> None:
     print(counter)
 
 
-def train_and_save(args: argparse.Namespace) -> tuple[Path, str]:
-    ensure_cuda()
-    resolve_precision(args)
-    set_seed(args.seed)
-    maybe_login(args.hf_token)
+def list_checkpoint_dirs(output_dir: Path) -> list[Path]:
+    def checkpoint_step(path: Path) -> int:
+        try:
+            return int(path.name.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            return -1
 
-    args.cache_dir.mkdir(parents=True, exist_ok=True)
-    model_path = download_model_repo(args)
-    train_dataset = load_training_dataset(args)
-    model, tokenizer = load_model_and_tokenizer(args, model_path)
-    model = apply_lora(args, model)
+    return sorted(
+        [path for path in output_dir.glob("checkpoint-*") if path.is_dir()],
+        key=checkpoint_step,
+    )
 
-    training_args = make_sft_config(args)
-    print_versions()
-    trainer = make_trainer(model, tokenizer, train_dataset, training_args)
-    print_training_state(trainer)
 
-    trainer.train()
+def get_checkpoint_epoch(checkpoint_dir: Path) -> float | None:
+    state_path = checkpoint_dir / "trainer_state.json"
+    if not state_path.exists():
+        return None
 
-    merged_model = trainer.model.merge_and_unload()
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+    epoch = state.get("epoch")
+    return float(epoch) if epoch is not None else None
+
+
+def save_merged_model_and_tokenizer(args: argparse.Namespace, merged_model, tokenizer) -> Path:
     merged_output_dir = get_default_merged_output_dir(args)
     merged_output_dir.mkdir(parents=True, exist_ok=True)
     merged_model.save_pretrained(str(merged_output_dir), safe_serialization=True)
@@ -552,7 +577,92 @@ def train_and_save(args: argparse.Namespace) -> tuple[Path, str]:
         tokenizer.push_to_hub(repo_id=args.hub_model_id, token=token_arg)
         print(f"Merged model pushed to: {args.hub_model_id}")
 
-    del trainer, model, merged_model
+    return merged_output_dir
+
+
+def load_tokenizer(args: argparse.Namespace, model_path: str):
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        add_eos_token=True,
+        cache_dir=str(args.cache_dir),
+        trust_remote_code=args.trust_remote_code,
+    )
+    tokenizer.padding_side = "right"
+    return tokenizer
+
+
+def load_base_model_for_merge(args: argparse.Namespace, model_path: str):
+    compute_dtype = dtype_from_name(args.bnb_4bit_compute_dtype)
+    model_kwargs: dict[str, Any] = {
+        "device_map": args.device_map,
+        "torch_dtype": compute_dtype,
+        "cache_dir": str(args.cache_dir),
+        "trust_remote_code": args.trust_remote_code,
+    }
+    if args.attn_implementation:
+        model_kwargs["attn_implementation"] = args.attn_implementation
+
+    model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+    model.config.use_cache = False
+    model.config.pretraining_tp = 1
+    return model
+
+
+def merge_adapter_checkpoint_and_save(args: argparse.Namespace, base_model_path: str, adapter_dir: Path) -> Path:
+    print(f"Loading best adapter checkpoint for merge: {adapter_dir}")
+    tokenizer = load_tokenizer(args, base_model_path)
+    base_model = load_base_model_for_merge(args, base_model_path)
+    set_pad_token(base_model, tokenizer)
+    peft_model = PeftModel.from_pretrained(base_model, str(adapter_dir))
+    merged_model = peft_model.merge_and_unload()
+    merged_output_dir = save_merged_model_and_tokenizer(args, merged_model, tokenizer)
+
+    del base_model, peft_model, merged_model
+    gc.collect()
+    torch.cuda.empty_cache()
+    return merged_output_dir
+
+
+def train_and_save(args: argparse.Namespace) -> tuple[Path, str]:
+    ensure_cuda()
+    resolve_precision(args)
+    set_seed(args.seed)
+    maybe_login(args.hf_token)
+
+    args.cache_dir.mkdir(parents=True, exist_ok=True)
+    model_path = download_model_repo(args)
+    train_dataset = load_training_dataset(args)
+    model, tokenizer = load_model_and_tokenizer(args, model_path)
+    model = apply_lora(args, model)
+
+    training_args = make_sft_config(args)
+    print_versions()
+    trainer = make_trainer(model, tokenizer, train_dataset, training_args)
+    print_training_state(trainer)
+
+    output_dir = Path(training_args.output_dir)
+    existing_checkpoints = set(list_checkpoint_dirs(output_dir))
+    trainer.train()
+
+    if args.select_best_model:
+        checkpoints = [path for path in list_checkpoint_dirs(output_dir) if path not in existing_checkpoints]
+        if not checkpoints:
+            checkpoints = list_checkpoint_dirs(output_dir)
+        if not checkpoints:
+            raise RuntimeError("No epoch checkpoints were saved, so best-model selection cannot run.")
+
+        del trainer, model, tokenizer
+        gc.collect()
+        torch.cuda.empty_cache()
+        best_checkpoint, _ = select_best_epoch_checkpoint(args, model_path, checkpoints)
+        merged_output_dir = merge_adapter_checkpoint_and_save(args, model_path, best_checkpoint)
+        return merged_output_dir, model_path
+
+    merged_model = trainer.model.merge_and_unload()
+    merged_output_dir = save_merged_model_and_tokenizer(args, merged_model, tokenizer)
+
+    del trainer, model, tokenizer, merged_model
+    gc.collect()
     torch.cuda.empty_cache()
     return merged_output_dir, model_path
 
@@ -599,11 +709,17 @@ def get_eval_output_path(args: argparse.Namespace, label: str) -> Path:
     return args.eval_output_path
 
 
-def make_lm_eval_model_args(args: argparse.Namespace, eval_model: str) -> str:
+def make_lm_eval_model_args(
+    args: argparse.Namespace,
+    eval_model: str,
+    peft_path: Path | None = None,
+) -> str:
     model_args = [
         f"pretrained={eval_model}",
         f"trust_remote_code={args.trust_remote_code}",
     ]
+    if peft_path is not None:
+        model_args.append(f"peft={peft_path}")
     if args.eval_dtype.lower() not in {"none", "null", "off"}:
         model_args.append(f"dtype={args.eval_dtype}")
     return ",".join(model_args)
@@ -646,6 +762,130 @@ def run_single_eval(args: argparse.Namespace, label: str, eval_model: str, outpu
     print(f"Running {label} evaluation:")
     print(shlex.join(cmd))
     subprocess.run(cmd, check=True)
+
+
+def run_lm_eval_for_checkpoint(
+    args: argparse.Namespace,
+    label: str,
+    base_model_path: str,
+    adapter_checkpoint: Path,
+    output_path: Path,
+) -> None:
+    output_path.mkdir(parents=True, exist_ok=True)
+    batch_size = args.best_eval_batch_size or args.eval_batch_size
+    model_args = make_lm_eval_model_args(args, base_model_path, peft_path=adapter_checkpoint)
+    lm_eval_bin = shutil.which("lm_eval")
+    cmd = [lm_eval_bin] if lm_eval_bin else [sys.executable, "-m", "lm_eval"]
+    cmd.extend(
+        [
+            "--model",
+            "hf",
+            "--model_args",
+            model_args,
+            "--tasks",
+            args.best_eval_tasks,
+            "--device",
+            args.eval_device,
+            "--batch_size",
+            str(batch_size),
+            "--num_fewshot",
+            "0",
+            "--output_path",
+            str(output_path),
+        ]
+    )
+
+    print(f"Running zero-shot best-model evaluation for {label}:")
+    print(shlex.join(cmd))
+    subprocess.run(cmd, check=True)
+
+
+def load_lm_eval_result(output_path: Path) -> tuple[dict[str, Any], Path]:
+    candidates = [output_path] if output_path.is_file() else sorted(
+        output_path.rglob("*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for candidate in candidates:
+        if "sample" in candidate.name.lower():
+            continue
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if isinstance(data, dict) and "results" in data:
+            return data, candidate
+
+    raise FileNotFoundError(f"Could not find an lm_eval result JSON under {output_path}.")
+
+
+def extract_lm_eval_metric(result: dict[str, Any], task: str, metric: str) -> float:
+    results = result.get("results", {})
+    task_result = results.get(task)
+    if task_result is None and results:
+        first_task = next(iter(results))
+        print(f"Task {task!r} not found in lm_eval results. Falling back to {first_task!r}.")
+        task_result = results[first_task]
+
+    if not isinstance(task_result, dict):
+        raise KeyError(f"No task metrics found for {task!r}.")
+
+    if metric in task_result:
+        return float(task_result[metric])
+
+    for key, value in task_result.items():
+        if key == metric or key.startswith(f"{metric},"):
+            return float(value)
+
+    raise KeyError(f"Metric {metric!r} not found for task {task!r}. Available metrics: {sorted(task_result)}")
+
+
+def select_best_epoch_checkpoint(
+    args: argparse.Namespace,
+    base_model_path: str,
+    checkpoints: list[Path],
+) -> tuple[Path, dict[str, Any]]:
+    eval_root = args.best_eval_output_dir
+    if eval_root is None:
+        eval_root = get_default_output_dir(args) / "epoch_zero_shot_eval" / f"run-{int(time.time())}"
+    eval_root.mkdir(parents=True, exist_ok=True)
+
+    task = args.best_eval_tasks.split(",")[0].strip()
+    records: list[dict[str, Any]] = []
+    for checkpoint in checkpoints:
+        output_path = eval_root / checkpoint.name
+        run_lm_eval_for_checkpoint(args, checkpoint.name, base_model_path, checkpoint, output_path)
+        result, result_file = load_lm_eval_result(output_path)
+        metric_value = extract_lm_eval_metric(result, task, args.best_eval_metric)
+        epoch = get_checkpoint_epoch(checkpoint)
+        record = {
+            "checkpoint_path": str(checkpoint),
+            "epoch": epoch,
+            "task": task,
+            "metric": args.best_eval_metric,
+            "metric_value": metric_value,
+            "result_file": str(result_file),
+        }
+        records.append(record)
+        print(f"{checkpoint.name}: {args.best_eval_metric}={metric_value:.6f}")
+
+    best_record = max(records, key=lambda item: item["metric_value"])
+    summary = {
+        "best_checkpoint_path": best_record["checkpoint_path"],
+        "best_metric_value": best_record["metric_value"],
+        "selection_metric": args.best_eval_metric,
+        "selection_tasks": args.best_eval_tasks,
+        "num_fewshot": 0,
+        "records": records,
+    }
+    summary_path = eval_root / "best_epoch_eval_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"Best checkpoint summary saved to: {summary_path}")
+    print(
+        "Best checkpoint: "
+        f"{best_record['checkpoint_path']} ({args.best_eval_metric}={best_record['metric_value']:.6f})"
+    )
+    return Path(best_record["checkpoint_path"]), best_record
 
 
 def run_eval(

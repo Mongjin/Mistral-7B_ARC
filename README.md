@@ -12,6 +12,7 @@ Default experiment:
 - Fine-tuning: QLoRA, `r=8`, `lora_alpha=16`, `target_modules=["q_proj", "v_proj"]`
 - Training: 1 epoch, batch size 4, learning rate `2e-4`, max length 1024
 - Precision: auto bf16 on supported GPUs such as A100, otherwise fp16
+- Best model selection: after training, evaluate each epoch checkpoint with zero-shot `arc_challenge` and save the checkpoint with the highest `acc_norm`
 - Evaluation: `lm-evaluation-harness`, `arc_challenge`, 25-shot, batch size 8
 
 ## Ubuntu setup
@@ -54,6 +55,23 @@ python run_mistral_arc_experiment.py \
 
 The script trains the LoRA adapter, merges it into the base model, saves the
 merged model, clears GPU memory, and then runs ARC Challenge evaluation.
+
+By default, the script saves a LoRA checkpoint at every epoch, runs zero-shot
+`lm_eval` on each epoch checkpoint, selects the checkpoint with the highest
+`acc_norm`, and only then merges/saves the best model. The epoch-selection
+summary is written under:
+
+```bash
+/tmp/huggingface_cache/results/epoch_zero_shot_eval/
+```
+
+Useful best-model selection options:
+
+- `--no-select-best-model` disables epoch-wise zero-shot selection and saves the final epoch model directly.
+- `--best-eval-tasks arc_challenge` controls the zero-shot task used for checkpoint selection.
+- `--best-eval-metric acc_norm` controls the metric used for selection.
+- `--best-eval-batch-size 8` overrides the batch size for epoch-wise zero-shot evaluation.
+- `--best-eval-output-dir /path/to/dir` changes where epoch-wise evaluation JSON files are written.
 
 To train on ARC Easy and ARC Challenge train examples instead of Alpaca:
 
