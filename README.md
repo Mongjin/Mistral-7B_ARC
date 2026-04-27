@@ -115,6 +115,23 @@ python run_mistral_arc_experiment.py \
   --eval-dtype none
 ```
 
+For error analysis, save per-sample inputs, predictions, references, and
+metrics:
+
+```bash
+python run_mistral_arc_experiment.py \
+  --eval-only \
+  --eval-model-id /tmp/huggingface_cache/mistral-7b-qlora-alpaca-sample-0.5k \
+  --eval-dtype none \
+  --eval-log-samples
+```
+
+With sample logging enabled, the default output directory is
+`/tmp/huggingface_cache/results/arc_challenge/finetuned/`. For baseline
+evaluation it is `/tmp/huggingface_cache/results/arc_challenge/baseline/`.
+Inside that directory, `lm_eval` writes the aggregate result plus a task-level
+sample file that can be filtered for correct and incorrect ARC examples.
+
 ## Optional Hub push
 
 Pushing is disabled by default to avoid accidental uploads. To push the merged

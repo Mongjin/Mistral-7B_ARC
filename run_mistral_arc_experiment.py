@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import inspect
-import json
 import os
 import shlex
 import shutil
@@ -102,6 +101,11 @@ def parse_args() -> argparse.Namespace:
         "--eval-dtype",
         default="float16",
         help="dtype passed to lm_eval hf model_args. Use 'none' to omit it for compatibility.",
+    )
+    parser.add_argument(
+        "--eval-log-samples",
+        action="store_true",
+        help="Save per-sample lm_eval inputs, outputs, and metrics for error analysis.",
     )
 
     args = parser.parse_args()
@@ -503,26 +507,33 @@ def resolve_baseline_eval_model(args: argparse.Namespace, base_model_path: str |
 
 def get_eval_output_path(args: argparse.Namespace, label: str) -> Path:
     if args.eval_output_path is None:
+        output_dir = args.cache_dir / "results" / args.eval_tasks
+        if args.eval_log_samples:
+            return output_dir / label
+
         filename = f"result-{args.num_fewshot}shot.json"
         if label != "finetuned":
             filename = f"{label}-{filename}"
-        return args.cache_dir / "results" / args.eval_tasks / filename
+        return output_dir / filename
 
     return args.eval_output_path
 
 
 def make_lm_eval_model_args(args: argparse.Namespace, eval_model: str) -> str:
-    model_args: dict[str, Any] = {
-        "pretrained": str(eval_model),
-        "trust_remote_code": args.trust_remote_code,
-    }
+    model_args = [
+        f"pretrained={eval_model}",
+        f"trust_remote_code={args.trust_remote_code}",
+    ]
     if args.eval_dtype.lower() not in {"none", "null", "off"}:
-        model_args["dtype"] = args.eval_dtype
-    return json.dumps(model_args)
+        model_args.append(f"dtype={args.eval_dtype}")
+    return ",".join(model_args)
 
 
 def run_single_eval(args: argparse.Namespace, label: str, eval_model: str, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.eval_log_samples and output_path.suffix == "":
+        output_path.mkdir(parents=True, exist_ok=True)
+    else:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
     model_args = make_lm_eval_model_args(args, eval_model)
     lm_eval_bin = shutil.which("lm_eval")
@@ -549,6 +560,9 @@ def run_single_eval(args: argparse.Namespace, label: str, eval_model: str, outpu
             str(output_path),
         ]
     )
+    if args.eval_log_samples:
+        cmd.append("--log_samples")
+
     print(f"Running {label} evaluation:")
     print(shlex.join(cmd))
     subprocess.run(cmd, check=True)
