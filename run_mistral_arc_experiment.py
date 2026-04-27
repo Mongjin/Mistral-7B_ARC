@@ -279,8 +279,8 @@ def format_arc_example(example: dict[str, Any]) -> dict[str, str]:
     texts = [str(text) for text in choices["text"]]
     answer = str(example["answerKey"])
     answer_text = texts[labels.index(answer)] if answer in labels else answer
-    prompt = f"Question: {example['question']}\nAnswer:"
-    text = f"<s> {prompt} \n {answer_text} </s>"
+    prompt = f"{example['question']} Answer: "
+    text = f"<s>{prompt}{answer_text}</s>"
     return {
         "instruction": "",
         "input": prompt,
