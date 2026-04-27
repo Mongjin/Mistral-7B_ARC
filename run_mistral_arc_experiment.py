@@ -16,7 +16,7 @@ from typing import Any
 
 import torch
 from datasets import concatenate_datasets, load_dataset
-from huggingface_hub import login, snapshot_download
+from huggingface_hub import HfApi, login, snapshot_download
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, set_seed
 from trl import SFTConfig, SFTTrainer
@@ -27,6 +27,14 @@ DEFAULT_DATASET_ID = "tatsu-lab/alpaca"
 DEFAULT_ARC_DATASET_ID = "allenai/ai2_arc"
 DEFAULT_MODEL_NAME = "mistral-7b-qlora-alpaca-sample-0.5k"
 TRAIN_COLUMNS = ["instruction", "input", "output", "text", "source"]
+HUB_ADAPTER_IGNORE_PATTERNS = [
+    "optimizer.pt",
+    "scheduler.pt",
+    "rng_state*.pth",
+    "scaler.pt",
+    "trainer_state.json",
+    "training_args.bin",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,10 +72,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir", type=Path, default=Path("/home/mongjin/tmp/huggingface_cache"))
     parser.add_argument("--base-local-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--adapter-output-dir", type=Path, default=None)
     parser.add_argument("--merged-output-dir", type=Path, default=None)
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
     parser.add_argument("--hub-model-id", default=None)
-    parser.add_argument("--push-to-hub", action="store_true")
+    parser.add_argument(
+        "--push-to-hub",
+        action="store_true",
+        help="Only active with --eval-only. Pushes the evaluated adapter/model after lm_eval succeeds.",
+    )
     parser.add_argument("--max-shard-size", default="5GB")
 
     parser.add_argument("--sample-size", type=int, default=500)
@@ -82,6 +95,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument("--save-strategy", choices=["steps", "epoch", "no"], default="steps")
     parser.add_argument("--save-steps", type=int, default=50)
+    parser.add_argument("--resume-from-checkpoint", type=Path, default=None)
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--optim", default="paged_adamw_32bit")
     parser.add_argument("--lr-scheduler-type", default="constant")
@@ -106,10 +120,16 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--download-base", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
+        "--save-merged-model",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also merge the best adapter into the base model and save a full model. Disabled by default.",
+    )
+    parser.add_argument(
         "--select-best-model",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Save each epoch checkpoint, run zero-shot lm_eval, and merge/save the checkpoint with best metric.",
+        help="Save each epoch checkpoint, run zero-shot lm_eval, and save the checkpoint with best metric.",
     )
     parser.add_argument("--best-eval-tasks", default="arc_challenge")
     parser.add_argument("--best-eval-metric", default="acc_norm")
@@ -124,11 +144,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--baseline-eval-model-id",
-        default="mistralai/Mistral-7B-v0.1",
+        default=None,
         help="Model id or local path for baseline evaluation. Defaults to the downloaded base model path when available.",
     )
     parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--eval-model-id", default=None)
+    parser.add_argument("--eval-peft-path", type=Path, default=None)
     parser.add_argument("--eval-output-path", type=Path, default=None)
     parser.add_argument("--eval-tasks", default="arc_challenge")
     parser.add_argument("--num-fewshot", type=int, default=25)
@@ -151,8 +172,14 @@ def parse_args() -> argparse.Namespace:
         args.base_local_dir = args.base_local_dir.expanduser().resolve()
     if args.output_dir is not None:
         args.output_dir = args.output_dir.expanduser().resolve()
+    if args.adapter_output_dir is not None:
+        args.adapter_output_dir = args.adapter_output_dir.expanduser().resolve()
     if args.merged_output_dir is not None:
         args.merged_output_dir = args.merged_output_dir.expanduser().resolve()
+    if args.resume_from_checkpoint is not None:
+        args.resume_from_checkpoint = args.resume_from_checkpoint.expanduser().resolve()
+    if args.eval_peft_path is not None:
+        args.eval_peft_path = args.eval_peft_path.expanduser().resolve()
     if args.eval_output_path is not None:
         args.eval_output_path = args.eval_output_path.expanduser().resolve()
     if args.best_eval_output_dir is not None:
@@ -244,6 +271,18 @@ def get_default_merged_output_dir(args: argparse.Namespace) -> Path:
     return args.cache_dir / DEFAULT_MODEL_NAME
 
 
+def get_default_adapter_output_dir(args: argparse.Namespace) -> Path:
+    if args.adapter_output_dir:
+        return args.adapter_output_dir
+    if args.merged_output_dir and not args.save_merged_model:
+        return args.merged_output_dir
+    if args.train_dataset == "arc":
+        return args.cache_dir / "mistral-7b-qlora-arc-train-adapter"
+    if args.train_dataset == "alpaca_arc":
+        return args.cache_dir / "mistral-7b-qlora-alpaca-arc-adapter"
+    return args.cache_dir / f"{DEFAULT_MODEL_NAME}-adapter"
+
+
 def download_model_repo(args: argparse.Namespace) -> str:
     cached_model_path = resolve_cached_base_model_path(args)
     if cached_model_path:
@@ -285,14 +324,15 @@ def format_arc_example(example: dict[str, Any], arc_format: str = "question_answ
     texts = [str(text) for text in choices["text"]]
     answer = str(example["answerKey"])
     answer_text = texts[labels.index(answer)] if answer in labels else answer
+    answer_text = " " + answer_text
 
     if arc_format == "question_choices_answer":
-        formatted_choices = " ".join(f"{label}. {choice_text}" for label, choice_text in zip(labels, texts))
-        prompt = f"{example['question']} Choices: {formatted_choices} Answer: "
+        formatted_choices = ". ".join(f"{label}. {choice_text}" for label, choice_text in zip(labels, texts))
+        prompt = f"{example['question']}\nChoices: {formatted_choices}\nAnswer:"
     else:
-        prompt = f"{example['question']} Answer: "
+        prompt = f"{example['question']}\nAnswer:"
 
-    text = f"<s>{prompt}{answer_text}</s>"
+    text = f"<s>Question: {prompt}{answer_text}</s>"
     return {
         "instruction": "",
         "input": prompt,
@@ -592,37 +632,93 @@ def clean_model_output_dir(output_dir: Path) -> None:
                 path.unlink()
 
 
-def save_merged_model_and_tokenizer(args: argparse.Namespace, merged_model, tokenizer) -> Path:
+def push_folder_to_hub(
+    args: argparse.Namespace,
+    folder_path: Path,
+    description: str,
+    ignore_patterns: list[str] | None = None,
+) -> None:
+    if not args.push_to_hub:
+        return
+    if not args.hub_model_id:
+        raise ValueError("--push-to-hub requires --hub-model-id.")
+
+    token_arg: str | bool | None = args.hf_token if args.hf_token else True
+    api = HfApi(token=args.hf_token)
+    api.create_repo(repo_id=args.hub_model_id, exist_ok=True, token=token_arg)
+    api.upload_folder(
+        repo_id=args.hub_model_id,
+        folder_path=str(folder_path),
+        commit_message=f"Upload {description}",
+        ignore_patterns=ignore_patterns,
+        token=token_arg,
+    )
+    print(f"{description} pushed to: {args.hub_model_id}")
+
+
+def copy_best_adapter_checkpoint(args: argparse.Namespace, checkpoint_dir: Path, base_model_path: str) -> Path:
+    adapter_output_dir = get_default_adapter_output_dir(args)
+    if adapter_output_dir.resolve() != checkpoint_dir.resolve():
+        if adapter_output_dir.exists():
+            shutil.rmtree(adapter_output_dir)
+        shutil.copytree(checkpoint_dir, adapter_output_dir)
+
+    tokenizer = load_tokenizer(args, base_model_path, add_eos_token=False)
+    tokenizer.save_pretrained(str(adapter_output_dir))
+
+    metadata = {
+        "base_model_id_or_path": base_model_path,
+        "checkpoint_path": str(checkpoint_dir),
+        "resume_from_checkpoint": str(adapter_output_dir),
+        "contains_trainer_state": True,
+        "contains_optimizer_state": (adapter_output_dir / "optimizer.pt").exists(),
+        "contains_scheduler_state": (adapter_output_dir / "scheduler.pt").exists(),
+        "save_merged_model": args.save_merged_model,
+    }
+    (adapter_output_dir / "adapter_experiment_metadata.json").write_text(
+        json.dumps(metadata, indent=2),
+        encoding="utf-8",
+    )
+    print(f"Best adapter checkpoint saved to: {adapter_output_dir}")
+    return adapter_output_dir
+
+
+def save_merged_model_and_tokenizer(
+    args: argparse.Namespace,
+    merged_model,
+    tokenizer,
+    tokenizer_source_path: str | None = None,
+) -> Path:
     merged_output_dir = get_default_merged_output_dir(args)
     merged_output_dir.mkdir(parents=True, exist_ok=True)
     clean_model_output_dir(merged_output_dir)
-    merged_model.save_pretrained(str(merged_output_dir), safe_serialization=True)
+
+    if tokenizer_source_path is not None:
+        tokenizer = load_tokenizer(args, tokenizer_source_path, add_eos_token=False)
+    elif hasattr(tokenizer, "add_eos_token"):
+        tokenizer.add_eos_token = False
+
+    set_pad_token(merged_model, tokenizer)
+    merged_model.save_pretrained(
+        str(merged_output_dir),
+        safe_serialization=True,
+        max_shard_size=args.max_shard_size,
+    )
     tokenizer.save_pretrained(str(merged_output_dir))
     print(f"Merged model saved to: {merged_output_dir}")
-
-    if args.push_to_hub:
-        if not args.hub_model_id:
-            raise ValueError("--push-to-hub requires --hub-model-id.")
-        token_arg: str | bool | None = args.hf_token if args.hf_token else True
-        merged_model.push_to_hub(
-            repo_id=args.hub_model_id,
-            token=token_arg,
-            max_shard_size=args.max_shard_size,
-            safe_serialization=True,
-        )
-        tokenizer.push_to_hub(repo_id=args.hub_model_id, token=token_arg)
-        print(f"Merged model pushed to: {args.hub_model_id}")
 
     return merged_output_dir
 
 
-def load_tokenizer(args: argparse.Namespace, model_path: str):
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
-        add_eos_token=True,
-        cache_dir=str(args.cache_dir),
-        trust_remote_code=args.trust_remote_code,
-    )
+def load_tokenizer(args: argparse.Namespace, model_path: str, add_eos_token: bool | None = None):
+    tokenizer_kwargs: dict[str, Any] = {
+        "cache_dir": str(args.cache_dir),
+        "trust_remote_code": args.trust_remote_code,
+    }
+    if add_eos_token is not None:
+        tokenizer_kwargs["add_eos_token"] = add_eos_token
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, **tokenizer_kwargs)
     tokenizer.padding_side = "right"
     return tokenizer
 
@@ -646,12 +742,17 @@ def load_base_model_for_merge(args: argparse.Namespace, model_path: str):
 
 def merge_adapter_checkpoint_and_save(args: argparse.Namespace, base_model_path: str, adapter_dir: Path) -> Path:
     print(f"Loading best adapter checkpoint for merge: {adapter_dir}")
-    tokenizer = load_tokenizer(args, base_model_path)
+    tokenizer = load_tokenizer(args, base_model_path, add_eos_token=False)
     base_model = load_base_model_for_merge(args, base_model_path)
     set_pad_token(base_model, tokenizer)
     peft_model = PeftModel.from_pretrained(base_model, str(adapter_dir))
     merged_model = peft_model.merge_and_unload()
-    merged_output_dir = save_merged_model_and_tokenizer(args, merged_model, tokenizer)
+    merged_output_dir = save_merged_model_and_tokenizer(
+        args,
+        merged_model,
+        tokenizer,
+        tokenizer_source_path=base_model_path,
+    )
 
     del base_model, peft_model, merged_model
     gc.collect()
@@ -659,7 +760,28 @@ def merge_adapter_checkpoint_and_save(args: argparse.Namespace, base_model_path:
     return merged_output_dir
 
 
-def train_and_save(args: argparse.Namespace) -> tuple[Path, str]:
+def save_final_adapter_without_best_selection(args: argparse.Namespace, trainer: SFTTrainer, model_path: str) -> Path:
+    adapter_output_dir = get_default_adapter_output_dir(args)
+    if adapter_output_dir.exists():
+        shutil.rmtree(adapter_output_dir)
+    trainer.save_model(str(adapter_output_dir))
+    tokenizer = load_tokenizer(args, model_path, add_eos_token=False)
+    tokenizer.save_pretrained(str(adapter_output_dir))
+    metadata = {
+        "base_model_id_or_path": model_path,
+        "resume_from_checkpoint": None,
+        "contains_trainer_state": False,
+        "note": "Use output_dir/checkpoint-* to resume training with optimizer state.",
+    }
+    (adapter_output_dir / "adapter_experiment_metadata.json").write_text(
+        json.dumps(metadata, indent=2),
+        encoding="utf-8",
+    )
+    print(f"Final adapter saved to: {adapter_output_dir}")
+    return adapter_output_dir
+
+
+def train_and_save(args: argparse.Namespace) -> tuple[Path, str, Path | None]:
     ensure_cuda()
     resolve_precision(args)
     set_seed(args.seed)
@@ -678,7 +800,9 @@ def train_and_save(args: argparse.Namespace) -> tuple[Path, str]:
 
     output_dir = Path(training_args.output_dir)
     existing_checkpoints = set(list_checkpoint_dirs(output_dir))
-    trainer.train()
+    trainer.train(
+        resume_from_checkpoint=str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
+    )
 
     if args.select_best_model:
         checkpoints = [path for path in list_checkpoint_dirs(output_dir) if path not in existing_checkpoints]
@@ -691,26 +815,81 @@ def train_and_save(args: argparse.Namespace) -> tuple[Path, str]:
         gc.collect()
         torch.cuda.empty_cache()
         best_checkpoint, _ = select_best_epoch_checkpoint(args, model_path, checkpoints)
-        merged_output_dir = merge_adapter_checkpoint_and_save(args, model_path, best_checkpoint)
-        return merged_output_dir, model_path
+        adapter_output_dir = copy_best_adapter_checkpoint(args, best_checkpoint, model_path)
+        if args.save_merged_model:
+            merged_output_dir = merge_adapter_checkpoint_and_save(args, model_path, best_checkpoint)
+            return merged_output_dir, model_path, None
+        return adapter_output_dir, model_path, adapter_output_dir
 
-    merged_model = trainer.model.merge_and_unload()
-    merged_output_dir = save_merged_model_and_tokenizer(args, merged_model, tokenizer)
+    if args.save_merged_model:
+        merged_model = trainer.model.merge_and_unload()
+        final_output_dir = save_merged_model_and_tokenizer(
+            args,
+            merged_model,
+            tokenizer,
+            tokenizer_source_path=model_path,
+        )
+        del merged_model
+        final_peft_path = None
+    else:
+        final_output_dir = save_final_adapter_without_best_selection(args, trainer, model_path)
+        final_peft_path = final_output_dir
 
-    del trainer, model, tokenizer, merged_model
+    del trainer, model, tokenizer
     gc.collect()
     torch.cuda.empty_cache()
-    return merged_output_dir, model_path
+    return final_output_dir, model_path, final_peft_path
 
 
 def resolve_eval_model(args: argparse.Namespace, merged_output_dir: Path | None) -> str:
     if args.eval_model_id:
         return args.eval_model_id
-    if args.push_to_hub and args.hub_model_id:
-        return args.hub_model_id
     if merged_output_dir:
         return str(merged_output_dir)
-    raise ValueError("--eval-only requires --eval-model-id.")
+    if args.merged_output_dir and looks_like_model_dir(args.merged_output_dir):
+        return str(args.merged_output_dir)
+    raise ValueError(
+        "--eval-only requires either --eval-peft-path/--adapter-output-dir for adapter evaluation "
+        "or --eval-model-id/--merged-output-dir for full-model evaluation."
+    )
+
+
+def resolve_eval_peft_path(args: argparse.Namespace, final_peft_path: Path | None) -> Path | None:
+    if args.eval_peft_path:
+        peft_path = args.eval_peft_path
+    elif final_peft_path:
+        peft_path = final_peft_path
+    elif args.eval_only and (args.adapter_output_dir or (not args.eval_model_id and not args.merged_output_dir)):
+        candidate = get_default_adapter_output_dir(args)
+        peft_path = candidate if (candidate / "adapter_config.json").exists() else None
+    else:
+        peft_path = None
+
+    if peft_path is None:
+        return None
+    if not peft_path.exists():
+        raise FileNotFoundError(f"Adapter path does not exist: {peft_path}")
+    if not (peft_path / "adapter_config.json").exists():
+        raise FileNotFoundError(f"Adapter config was not found under: {peft_path}")
+    return peft_path
+
+
+def resolve_adapter_eval_base_model(args: argparse.Namespace, base_model_path: str | None) -> str:
+    if args.eval_model_id:
+        return args.eval_model_id
+    if base_model_path:
+        return base_model_path
+
+    cached_model_path = resolve_cached_base_model_path(args)
+    if cached_model_path:
+        return str(cached_model_path)
+
+    expected_local_dir = get_base_local_dir(args)
+    print(
+        "No local base model repository was found for adapter evaluation. "
+        f"Expected {expected_local_dir}. Falling back to model id: {args.model_id}"
+    )
+    return args.model_id
 
 
 def resolve_baseline_eval_model(args: argparse.Namespace, base_model_path: str | None) -> str:
@@ -761,13 +940,19 @@ def make_lm_eval_model_args(
     return ",".join(model_args)
 
 
-def run_single_eval(args: argparse.Namespace, label: str, eval_model: str, output_path: Path) -> None:
+def run_single_eval(
+    args: argparse.Namespace,
+    label: str,
+    eval_model: str,
+    output_path: Path,
+    peft_path: Path | None = None,
+) -> None:
     if args.eval_log_samples and output_path.suffix == "":
         output_path.mkdir(parents=True, exist_ok=True)
     else:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    model_args = make_lm_eval_model_args(args, eval_model)
+    model_args = make_lm_eval_model_args(args, eval_model, peft_path=peft_path)
     lm_eval_bin = shutil.which("lm_eval")
     if lm_eval_bin:
         cmd = [lm_eval_bin]
@@ -926,30 +1111,94 @@ def select_best_epoch_checkpoint(
 
 def run_eval(
     args: argparse.Namespace,
-    merged_output_dir: Path | None,
+    final_output_dir: Path | None,
     base_model_path: str | None = None,
-) -> None:
+    final_peft_path: Path | None = None,
+) -> dict[str, Any]:
     if args.eval_baseline:
         label = "baseline"
         eval_model = resolve_baseline_eval_model(args, base_model_path)
+        peft_path = None
     else:
-        label = "finetuned"
-        eval_model = resolve_eval_model(args, merged_output_dir)
+        peft_path = resolve_eval_peft_path(args, final_peft_path)
+        if peft_path is not None:
+            label = "finetuned_adapter"
+            eval_model = resolve_adapter_eval_base_model(args, base_model_path)
+        else:
+            label = "finetuned"
+            eval_model = resolve_eval_model(args, final_output_dir)
 
     output_path = get_eval_output_path(args, label)
-    run_single_eval(args, label, eval_model, output_path)
+    run_single_eval(args, label, eval_model, output_path, peft_path=peft_path)
+    return {
+        "label": label,
+        "eval_model": eval_model,
+        "output_path": output_path,
+        "peft_path": peft_path,
+    }
+
+
+def handle_eval_only_artifacts(args: argparse.Namespace, eval_info: dict[str, Any]) -> None:
+    if not args.save_merged_model and not args.push_to_hub:
+        return
+    if not args.eval_only:
+        print("Artifact push/save after evaluation is only active with --eval-only. Skipping for this training run.")
+        return
+    if args.eval_baseline:
+        if args.push_to_hub:
+            raise ValueError("--push-to-hub is not supported with --eval-baseline.")
+        return
+
+    peft_path = eval_info["peft_path"]
+    eval_model = eval_info["eval_model"]
+    merged_output_dir = None
+    if peft_path is not None:
+        if args.save_merged_model:
+            merged_output_dir = merge_adapter_checkpoint_and_save(args, str(eval_model), peft_path)
+        if not args.push_to_hub:
+            return
+        if merged_output_dir is not None:
+            push_folder_to_hub(args, merged_output_dir, "evaluated merged model")
+        else:
+            push_folder_to_hub(
+                args,
+                peft_path,
+                "evaluated adapter",
+                ignore_patterns=HUB_ADAPTER_IGNORE_PATTERNS,
+            )
+        return
+
+    if not args.push_to_hub:
+        return
+
+    eval_model_path = Path(str(eval_model)).expanduser()
+    if not eval_model_path.is_dir():
+        raise ValueError(
+            "--push-to-hub without adapter evaluation requires a local model directory from "
+            "--eval-model-id or --merged-output-dir."
+        )
+    push_folder_to_hub(args, eval_model_path, "evaluated model")
 
 
 def main() -> None:
     args = parse_args()
     if args.eval_only:
         maybe_login(args.hf_token)
-        run_eval(args, merged_output_dir=None)
+        eval_info = run_eval(args, final_output_dir=None)
+        handle_eval_only_artifacts(args, eval_info)
         return
 
-    merged_output_dir, base_model_path = train_and_save(args)
+    if args.push_to_hub:
+        print("--push-to-hub is only active with --eval-only. This training run will save locally only.")
+
+    final_output_dir, base_model_path, final_peft_path = train_and_save(args)
     if args.run_eval:
-        run_eval(args, merged_output_dir, base_model_path=base_model_path)
+        run_eval(
+            args,
+            final_output_dir,
+            base_model_path=base_model_path,
+            final_peft_path=final_peft_path,
+        )
 
 
 if __name__ == "__main__":

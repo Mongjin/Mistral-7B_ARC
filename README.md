@@ -12,7 +12,8 @@ Default experiment:
 - Fine-tuning: QLoRA, `r=8`, `lora_alpha=16`, `target_modules=["q_proj", "v_proj"]`
 - Training: 1 epoch, batch size 4, learning rate `2e-4`, max length 1024
 - Precision: auto bf16 on supported GPUs such as A100, otherwise fp16
-- Best model selection: after training, evaluate each epoch checkpoint with zero-shot `arc_challenge` and save the checkpoint with the highest `acc_norm`
+- Best model selection: after training, evaluate each epoch checkpoint with zero-shot `arc_challenge` and save the adapter checkpoint with the highest `acc_norm`
+- Final save: adapter-only by default; use `--save-merged-model` only when a full merged model is needed
 - Evaluation: `lm-evaluation-harness`, `arc_challenge`, 25-shot, batch size 8
 
 ## Ubuntu setup
@@ -50,15 +51,16 @@ source .venv/bin/activate
 
 python run_mistral_arc_experiment.py \
   --cache-dir /tmp/huggingface_cache \
-  --merged-output-dir /tmp/huggingface_cache/mistral-7b-qlora-alpaca-sample-0.5k
+  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-alpaca-sample-0.5k-adapter
 ```
 
-The script trains the LoRA adapter, merges it into the base model, saves the
-merged model, clears GPU memory, and then runs ARC Challenge evaluation.
+The script trains the LoRA adapter, saves the best adapter checkpoint, clears
+GPU memory, and then runs ARC Challenge evaluation with `pretrained=base,peft=adapter`.
 
 By default, the script saves a LoRA checkpoint at every epoch, runs zero-shot
 `lm_eval` on each epoch checkpoint, selects the checkpoint with the highest
-`acc_norm`, and only then merges/saves the best model. The epoch-selection
+`acc_norm`, and copies that best checkpoint to the final adapter directory. This
+keeps the adapter plus Trainer state needed for resume. The epoch-selection
 summary is written under:
 
 ```bash
@@ -72,6 +74,8 @@ Useful best-model selection options:
 - `--best-eval-metric acc_norm` controls the metric used for selection.
 - `--best-eval-batch-size 8` overrides the batch size for epoch-wise zero-shot evaluation.
 - `--best-eval-output-dir /path/to/dir` changes where epoch-wise evaluation JSON files are written.
+- `--resume-from-checkpoint /path/to/checkpoint` resumes training from a saved checkpoint with optimizer/scheduler state.
+- `--save-merged-model` additionally saves a full merged model locally. Hub push is handled from `--eval-only`.
 
 To train on ARC Easy and ARC Challenge train examples instead of Alpaca:
 
@@ -79,7 +83,7 @@ To train on ARC Easy and ARC Challenge train examples instead of Alpaca:
 python run_mistral_arc_experiment.py \
   --cache-dir /tmp/huggingface_cache \
   --train-dataset arc \
-  --merged-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train
+  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train-adapter
 ```
 
 To train ARC with every answer choice shown before `Answer:`:
@@ -89,7 +93,7 @@ python run_mistral_arc_experiment.py \
   --cache-dir /tmp/huggingface_cache \
   --train-dataset arc \
   --arc-format question_choices_answer \
-  --merged-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-choices
+  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-choices-adapter
 ```
 
 To mix the original 500 Alpaca samples with all ARC train examples:
@@ -98,7 +102,7 @@ To mix the original 500 Alpaca samples with all ARC train examples:
 python run_mistral_arc_experiment.py \
   --cache-dir /tmp/huggingface_cache \
   --train-dataset alpaca_arc \
-  --merged-output-dir /tmp/huggingface_cache/mistral-7b-qlora-alpaca-arc
+  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-alpaca-arc-adapter
 ```
 
 ARC options:
@@ -114,7 +118,6 @@ To evaluate the original Mistral-7B baseline instead of the fine-tuned model:
 ```bash
 python run_mistral_arc_experiment.py \
   --cache-dir /tmp/huggingface_cache \
-  --merged-output-dir /tmp/huggingface_cache/mistral-7b-qlora-alpaca-sample-0.5k \
   --eval-baseline
 ```
 
@@ -144,6 +147,21 @@ python run_mistral_arc_experiment.py \
   --eval-model-id /tmp/huggingface_cache/mistral-7b-qlora-alpaca-sample-0.5k
 ```
 
+To evaluate an adapter-only result, `lm_eval` must load both the original
+Mistral backbone and the LoRA adapter. If the backbone is already under
+`/tmp/huggingface_cache/mistralai/Mistral-7B-v0.1`, this is enough:
+
+```bash
+python run_mistral_arc_experiment.py \
+  --cache-dir /tmp/huggingface_cache \
+  --eval-only \
+  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train-adapter
+```
+
+Use `--eval-model-id /path/to/base-mistral` when the backbone lives somewhere
+else, and use `--eval-peft-path /path/to/adapter` when you do not want to use
+`--adapter-output-dir`.
+
 To evaluate only the unfine-tuned baseline:
 
 ```bash
@@ -166,7 +184,8 @@ omit the evaluation dtype argument:
 ```bash
 python run_mistral_arc_experiment.py \
   --eval-only \
-  --eval-model-id /tmp/huggingface_cache/mistral-7b-qlora-alpaca-sample-0.5k \
+  --eval-model-id /tmp/huggingface_cache/mistralai/Mistral-7B-v0.1 \
+  --eval-peft-path /tmp/huggingface_cache/mistral-7b-qlora-arc-train-adapter \
   --eval-dtype none
 ```
 
@@ -176,27 +195,52 @@ metrics:
 ```bash
 python run_mistral_arc_experiment.py \
   --eval-only \
-  --eval-model-id /tmp/huggingface_cache/mistral-7b-qlora-alpaca-sample-0.5k \
+  --eval-model-id /tmp/huggingface_cache/mistralai/Mistral-7B-v0.1 \
+  --eval-peft-path /tmp/huggingface_cache/mistral-7b-qlora-arc-train-adapter \
   --eval-dtype none \
   --eval-log-samples
 ```
 
 With sample logging enabled, the default output directory is
-`/tmp/huggingface_cache/results/arc_challenge/finetuned/`. For baseline
-evaluation it is `/tmp/huggingface_cache/results/arc_challenge/baseline/`.
+`/tmp/huggingface_cache/results/arc_challenge/finetuned_adapter/` for adapter
+evaluation. For baseline evaluation it is
+`/tmp/huggingface_cache/results/arc_challenge/baseline/`.
 Inside that directory, `lm_eval` writes the aggregate result plus a task-level
 sample file that can be filtered for correct and incorrect ARC examples.
 
 ## Optional Hub push
 
-Pushing is disabled by default to avoid accidental uploads. To push the merged
-model and tokenizer:
+Pushing is disabled by default to avoid accidental uploads. Training runs save
+locally only. To decide based on evaluation results, run `--eval-only` first;
+adding `--push-to-hub` uploads the evaluated artifact after `lm_eval` succeeds.
+For adapter evaluation, the upload contains adapter/tokenizer files and skips
+local resume state such as optimizer/scheduler/RNG files:
 
 ```bash
 HF_TOKEN=your_token_here python run_mistral_arc_experiment.py \
-  --hub-model-id your-hf-id/mistral-7b-qlora-alpaca-sample-0.5k \
+  --cache-dir /tmp/huggingface_cache \
+  --eval-only \
+  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train-adapter \
+  --hub-model-id your-hf-id/mistral-7b-qlora-arc-train-adapter \
   --push-to-hub
 ```
+
+To evaluate an adapter, save a full merged model locally, and push that merged
+model instead:
+
+```bash
+HF_TOKEN=your_token_here python run_mistral_arc_experiment.py \
+  --cache-dir /tmp/huggingface_cache \
+  --eval-only \
+  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train-adapter \
+  --save-merged-model \
+  --merged-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train-merged \
+  --hub-model-id your-hf-id/mistral-7b-qlora-arc-train-merged \
+  --push-to-hub
+```
+
+Omit `--push-to-hub` from the command above if you only want to evaluate and
+save the merged model locally.
 
 ## Useful A100 options
 
