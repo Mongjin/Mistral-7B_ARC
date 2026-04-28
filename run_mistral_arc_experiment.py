@@ -79,7 +79,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--push-to-hub",
         action="store_true",
-        help="Only active with --eval-only. Pushes the evaluated adapter/model after lm_eval succeeds.",
+        help="Pushes an adapter/model to the Hub. Use with --eval-only or --push-only.",
+    )
+    parser.add_argument(
+        "--push-only",
+        action="store_true",
+        help="Push a known-good adapter/model to the Hub without running training or lm_eval.",
     )
     parser.add_argument("--max-shard-size", default="5GB")
 
@@ -849,8 +854,8 @@ def resolve_eval_model(args: argparse.Namespace, merged_output_dir: Path | None)
     if args.merged_output_dir and looks_like_model_dir(args.merged_output_dir):
         return str(args.merged_output_dir)
     raise ValueError(
-        "--eval-only requires either --eval-peft-path/--adapter-output-dir for adapter evaluation "
-        "or --eval-model-id/--merged-output-dir for full-model evaluation."
+        "--eval-only/--push-only requires either --eval-peft-path/--adapter-output-dir for adapter mode "
+        "or --eval-model-id/--merged-output-dir for full-model mode."
     )
 
 
@@ -859,7 +864,9 @@ def resolve_eval_peft_path(args: argparse.Namespace, final_peft_path: Path | Non
         peft_path = args.eval_peft_path
     elif final_peft_path:
         peft_path = final_peft_path
-    elif args.eval_only and (args.adapter_output_dir or (not args.eval_model_id and not args.merged_output_dir)):
+    elif (args.eval_only or args.push_only) and (
+        args.adapter_output_dir or (not args.eval_model_id and not args.merged_output_dir)
+    ):
         candidate = get_default_adapter_output_dir(args)
         peft_path = candidate if (candidate / "adapter_config.json").exists() else None
     else:
@@ -1138,11 +1145,11 @@ def run_eval(
     }
 
 
-def handle_eval_only_artifacts(args: argparse.Namespace, eval_info: dict[str, Any]) -> None:
+def handle_finetuned_artifacts(args: argparse.Namespace, eval_info: dict[str, Any]) -> None:
     if not args.save_merged_model and not args.push_to_hub:
         return
-    if not args.eval_only:
-        print("Artifact push/save after evaluation is only active with --eval-only. Skipping for this training run.")
+    if not (args.eval_only or args.push_only):
+        print("Artifact push/save is only active with --eval-only or --push-only. Skipping for this training run.")
         return
     if args.eval_baseline:
         if args.push_to_hub:
@@ -1154,16 +1161,18 @@ def handle_eval_only_artifacts(args: argparse.Namespace, eval_info: dict[str, An
     merged_output_dir = None
     if peft_path is not None:
         if args.save_merged_model:
+            ensure_cuda()
+            resolve_precision(args)
             merged_output_dir = merge_adapter_checkpoint_and_save(args, str(eval_model), peft_path)
         if not args.push_to_hub:
             return
         if merged_output_dir is not None:
-            push_folder_to_hub(args, merged_output_dir, "evaluated merged model")
+            push_folder_to_hub(args, merged_output_dir, "selected merged model")
         else:
             push_folder_to_hub(
                 args,
                 peft_path,
-                "evaluated adapter",
+                "selected adapter",
                 ignore_patterns=HUB_ADAPTER_IGNORE_PATTERNS,
             )
         return
@@ -1177,19 +1186,48 @@ def handle_eval_only_artifacts(args: argparse.Namespace, eval_info: dict[str, An
             "--push-to-hub without adapter evaluation requires a local model directory from "
             "--eval-model-id or --merged-output-dir."
         )
-    push_folder_to_hub(args, eval_model_path, "evaluated model")
+    push_folder_to_hub(args, eval_model_path, "selected model")
+
+
+def resolve_push_only_artifact(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.push_to_hub:
+        raise ValueError("--push-only requires --push-to-hub.")
+    if args.eval_baseline:
+        raise ValueError("--push-only cannot be used with --eval-baseline.")
+
+    peft_path = resolve_eval_peft_path(args, final_peft_path=None)
+    if peft_path is not None:
+        return {
+            "label": "finetuned_adapter",
+            "eval_model": resolve_adapter_eval_base_model(args, base_model_path=None),
+            "output_path": None,
+            "peft_path": peft_path,
+        }
+
+    return {
+        "label": "finetuned",
+        "eval_model": resolve_eval_model(args, merged_output_dir=None),
+        "output_path": None,
+        "peft_path": None,
+    }
 
 
 def main() -> None:
     args = parse_args()
+    if args.push_only:
+        maybe_login(args.hf_token)
+        artifact_info = resolve_push_only_artifact(args)
+        handle_finetuned_artifacts(args, artifact_info)
+        return
+
     if args.eval_only:
         maybe_login(args.hf_token)
         eval_info = run_eval(args, final_output_dir=None)
-        handle_eval_only_artifacts(args, eval_info)
+        handle_finetuned_artifacts(args, eval_info)
         return
 
     if args.push_to_hub:
-        print("--push-to-hub is only active with --eval-only. This training run will save locally only.")
+        print("--push-to-hub is only active with --eval-only or --push-only. This training run will save locally only.")
 
     final_output_dir, base_model_path, final_peft_path = train_and_save(args)
     if args.run_eval:

@@ -225,6 +225,18 @@ HF_TOKEN=your_token_here python run_mistral_arc_experiment.py \
   --push-to-hub
 ```
 
+If you already know which fine-tuned adapter is best and do not want to run
+`lm_eval`, use `--push-only`:
+
+```bash
+HF_TOKEN=your_token_here python run_mistral_arc_experiment.py \
+  --cache-dir /tmp/huggingface_cache \
+  --push-only \
+  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train-adapter \
+  --hub-model-id your-hf-id/mistral-7b-qlora-arc-train-adapter \
+  --push-to-hub
+```
+
 To evaluate an adapter, save a full merged model locally, and push that merged
 model instead:
 
@@ -241,6 +253,19 @@ HF_TOKEN=your_token_here python run_mistral_arc_experiment.py \
 
 Omit `--push-to-hub` from the command above if you only want to evaluate and
 save the merged model locally.
+
+To skip evaluation and directly merge/push a known-good adapter:
+
+```bash
+HF_TOKEN=your_token_here python run_mistral_arc_experiment.py \
+  --cache-dir /tmp/huggingface_cache \
+  --push-only \
+  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train-adapter \
+  --save-merged-model \
+  --merged-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train-merged \
+  --hub-model-id your-hf-id/mistral-7b-qlora-arc-train-merged \
+  --push-to-hub
+```
 
 ## Useful A100 options
 
