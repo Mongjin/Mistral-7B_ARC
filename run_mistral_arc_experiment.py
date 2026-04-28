@@ -5,6 +5,7 @@ import gc
 import inspect
 import json
 import os
+import random
 import shlex
 import shutil
 import subprocess
@@ -25,6 +26,8 @@ from trl import SFTConfig, SFTTrainer
 DEFAULT_MODEL_ID = "mistralai/Mistral-7B-v0.1"
 DEFAULT_DATASET_ID = "tatsu-lab/alpaca"
 DEFAULT_ARC_DATASET_ID = "allenai/ai2_arc"
+DEFAULT_SCIQ_DATASET_ID = "allenai/sciq"
+DEFAULT_OPENBOOKQA_DATASET_ID = "allenai/openbookqa"
 DEFAULT_MODEL_NAME = "mistral-7b-qlora-alpaca-sample-0.5k"
 TRAIN_COLUMNS = ["instruction", "input", "output", "text", "source"]
 HUB_ADAPTER_IGNORE_PATTERNS = [
@@ -48,9 +51,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument(
         "--train-dataset",
-        choices=["alpaca", "arc", "alpaca_arc"],
+        choices=[
+            "alpaca",
+            "arc",
+            "sciq",
+            "sciqa",
+            "openbookqa",
+            "alpaca_arc",
+            "sciq_openbookqa",
+            "sciqa_openbookqa",
+            "science_qa",
+            "arc_sciq_openbookqa",
+            "all",
+        ],
         default="alpaca",
-        help="Training data source. 'arc' uses AI2 ARC-Easy and ARC-Challenge train splits.",
+        help="Training data source. MCQA datasets share --arc-format prompt formatting.",
     )
     parser.add_argument("--dataset-id", default=DEFAULT_DATASET_ID)
     parser.add_argument("--dataset-split", default="train")
@@ -61,13 +76,30 @@ def parse_args() -> argparse.Namespace:
         "--arc-format",
         choices=["question_answer", "question_choices_answer"],
         default="question_answer",
-        help="ARC SFT prompt format. Use question_choices_answer to include all answer choices before Answer:",
+        help="MCQA SFT prompt format for ARC, SciQ, and OpenBookQA.",
     )
     parser.add_argument(
         "--arc-sample-size",
         type=int,
         default=0,
         help="Number of combined ARC examples to use. Use 0 or a negative value for all ARC train examples.",
+    )
+    parser.add_argument("--sciq-dataset-id", default=DEFAULT_SCIQ_DATASET_ID)
+    parser.add_argument("--sciq-split", default="train")
+    parser.add_argument(
+        "--sciq-sample-size",
+        type=int,
+        default=0,
+        help="Number of SciQ examples to use. Use 0 or a negative value for all SciQ train examples.",
+    )
+    parser.add_argument("--openbookqa-dataset-id", default=DEFAULT_OPENBOOKQA_DATASET_ID)
+    parser.add_argument("--openbookqa-configs", nargs="+", default=["main"])
+    parser.add_argument("--openbookqa-split", default="train")
+    parser.add_argument(
+        "--openbookqa-sample-size",
+        type=int,
+        default=0,
+        help="Number of combined OpenBookQA examples to use. Use 0 or a negative value for all examples.",
     )
     parser.add_argument("--cache-dir", type=Path, default=Path("/home/mongjin/tmp/huggingface_cache"))
     parser.add_argument("--base-local-dir", type=Path, default=None)
@@ -299,6 +331,9 @@ def get_default_merged_output_dir(args: argparse.Namespace) -> Path:
         return args.cache_dir / "mistral-7b-qlora-arc-train"
     if args.train_dataset == "alpaca_arc":
         return args.cache_dir / "mistral-7b-qlora-alpaca-arc"
+    if args.train_dataset != "alpaca":
+        dataset_slug = args.train_dataset.replace("_", "-")
+        return args.cache_dir / f"mistral-7b-qlora-{dataset_slug}"
     return args.cache_dir / DEFAULT_MODEL_NAME
 
 
@@ -311,6 +346,9 @@ def get_default_adapter_output_dir(args: argparse.Namespace) -> Path:
         return args.cache_dir / "mistral-7b-qlora-arc-train-adapter"
     if args.train_dataset == "alpaca_arc":
         return args.cache_dir / "mistral-7b-qlora-alpaca-arc-adapter"
+    if args.train_dataset != "alpaca":
+        dataset_slug = args.train_dataset.replace("_", "-")
+        return args.cache_dir / f"mistral-7b-qlora-{dataset_slug}-adapter"
     return args.cache_dir / f"{DEFAULT_MODEL_NAME}-adapter"
 
 
@@ -349,27 +387,102 @@ def format_alpaca_example(example: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def format_mcqa_text(
+    question: str,
+    answer_text: str,
+    labels: list[str],
+    choices: list[str],
+    arc_format: str,
+) -> tuple[str, str, str]:
+    answer_text = " " + answer_text
+
+    if arc_format == "question_choices_answer":
+        formatted_choices = ". ".join(f"{label}. {choice_text}" for label, choice_text in zip(labels, choices))
+        prompt = f"{question}\nChoices: {formatted_choices}\nAnswer:"
+    else:
+        prompt = f"{question}\nAnswer:"
+
+    text = f"<s>Question: {prompt}{answer_text}</s>"
+    return prompt, answer_text, text
+
+
 def format_arc_example(example: dict[str, Any], arc_format: str = "question_answer") -> dict[str, str]:
     choices = example["choices"]
     labels = [str(label) for label in choices["label"]]
     texts = [str(text) for text in choices["text"]]
     answer = str(example["answerKey"])
     answer_text = texts[labels.index(answer)] if answer in labels else answer
-    answer_text = " " + answer_text
-
-    if arc_format == "question_choices_answer":
-        formatted_choices = ". ".join(f"{label}. {choice_text}" for label, choice_text in zip(labels, texts))
-        prompt = f"{example['question']}\nChoices: {formatted_choices}\nAnswer:"
-    else:
-        prompt = f"{example['question']}\nAnswer:"
-
-    text = f"<s>Question: {prompt}{answer_text}</s>"
+    prompt, answer_text, text = format_mcqa_text(
+        str(example["question"]),
+        str(answer_text),
+        labels,
+        texts,
+        arc_format,
+    )
     return {
         "instruction": "",
         "input": prompt,
         "output": answer_text,
         "text": text,
         "source": "arc",
+    }
+
+
+def format_sciq_example(
+    example: dict[str, Any],
+    index: int,
+    arc_format: str = "question_answer",
+    seed: int = 42,
+) -> dict[str, str]:
+    correct_answer = str(example["correct_answer"]).strip()
+    choice_texts = [
+        correct_answer,
+        str(example["distractor1"]).strip(),
+        str(example["distractor2"]).strip(),
+        str(example["distractor3"]).strip(),
+    ]
+    rng = random.Random(f"{seed}:{index}:{example['question']}")
+    rng.shuffle(choice_texts)
+    labels = ["A", "B", "C", "D"]
+    prompt, answer_text, text = format_mcqa_text(
+        str(example["question"]),
+        correct_answer,
+        labels,
+        choice_texts,
+        arc_format,
+    )
+    return {
+        "instruction": "",
+        "input": prompt,
+        "output": answer_text,
+        "text": text,
+        "source": "sciq",
+    }
+
+
+def format_openbookqa_example(
+    example: dict[str, Any],
+    arc_format: str = "question_answer",
+    source: str = "openbookqa",
+) -> dict[str, str]:
+    choices = example["choices"]
+    labels = [str(label) for label in choices["label"]]
+    texts = [str(text) for text in choices["text"]]
+    answer = str(example["answerKey"])
+    answer_text = texts[labels.index(answer)] if answer in labels else answer
+    prompt, answer_text, text = format_mcqa_text(
+        str(example["question_stem"]),
+        str(answer_text),
+        labels,
+        texts,
+        arc_format,
+    )
+    return {
+        "instruction": "",
+        "input": prompt,
+        "output": answer_text,
+        "text": text,
+        "source": source,
     }
 
 
@@ -414,12 +527,70 @@ def load_arc_training_dataset(args: argparse.Namespace):
     return dataset
 
 
+def load_sciq_training_dataset(args: argparse.Namespace):
+    dataset = load_dataset(
+        args.sciq_dataset_id,
+        split=args.sciq_split,
+        cache_dir=str(args.cache_dir),
+    )
+    dataset = dataset.map(
+        format_sciq_example,
+        with_indices=True,
+        fn_kwargs={"arc_format": args.arc_format, "seed": args.seed},
+    ).select_columns(TRAIN_COLUMNS)
+    dataset = sample_dataset(dataset, args.sciq_sample_size, args.seed, "SciQ")
+    return dataset
+
+
+def load_openbookqa_training_dataset(args: argparse.Namespace):
+    openbookqa_datasets = []
+    for config in args.openbookqa_configs:
+        dataset = load_dataset(
+            args.openbookqa_dataset_id,
+            config,
+            split=args.openbookqa_split,
+            cache_dir=str(args.cache_dir),
+        )
+        dataset = dataset.map(
+            format_openbookqa_example,
+            fn_kwargs={"arc_format": args.arc_format, "source": f"openbookqa-{config}"},
+        ).select_columns(TRAIN_COLUMNS)
+        openbookqa_datasets.append(dataset)
+        print(f"Loaded {len(dataset)} examples from {args.openbookqa_dataset_id}/{config}/{args.openbookqa_split}.")
+
+    dataset = concatenate_datasets(openbookqa_datasets)
+    dataset = sample_dataset(dataset, args.openbookqa_sample_size, args.seed, "OpenBookQA")
+    return dataset
+
+
+def get_training_sources(train_dataset: str) -> set[str]:
+    source_map = {
+        "alpaca": {"alpaca"},
+        "arc": {"arc"},
+        "sciq": {"sciq"},
+        "sciqa": {"sciq"},
+        "openbookqa": {"openbookqa"},
+        "alpaca_arc": {"alpaca", "arc"},
+        "sciq_openbookqa": {"sciq", "openbookqa"},
+        "sciqa_openbookqa": {"sciq", "openbookqa"},
+        "science_qa": {"sciq", "openbookqa"},
+        "arc_sciq_openbookqa": {"arc", "sciq", "openbookqa"},
+        "all": {"alpaca", "arc", "sciq", "openbookqa"},
+    }
+    return source_map[train_dataset]
+
+
 def load_training_dataset(args: argparse.Namespace):
+    sources = get_training_sources(args.train_dataset)
     datasets = []
-    if args.train_dataset in {"alpaca", "alpaca_arc"}:
+    if "alpaca" in sources:
         datasets.append(load_alpaca_training_dataset(args))
-    if args.train_dataset in {"arc", "alpaca_arc"}:
+    if "arc" in sources:
         datasets.append(load_arc_training_dataset(args))
+    if "sciq" in sources:
+        datasets.append(load_sciq_training_dataset(args))
+    if "openbookqa" in sources:
+        datasets.append(load_openbookqa_training_dataset(args))
 
     if len(datasets) == 1:
         dataset = datasets[0]
