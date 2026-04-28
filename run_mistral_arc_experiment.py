@@ -156,6 +156,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-model-id", default=None)
     parser.add_argument("--eval-peft-path", type=Path, default=None)
     parser.add_argument("--eval-output-path", type=Path, default=None)
+    parser.add_argument(
+        "--eval-checkpoints",
+        action="store_true",
+        help="With --eval-only, evaluate selected checkpoint adapters or every checkpoint under a directory.",
+    )
+    parser.add_argument(
+        "--eval-checkpoint-paths",
+        nargs="+",
+        type=Path,
+        default=None,
+        help="Specific checkpoint adapter directories to evaluate. Use this to avoid evaluating every checkpoint.",
+    )
+    parser.add_argument(
+        "--eval-checkpoint-dir",
+        type=Path,
+        default=None,
+        help="Directory containing checkpoint-* adapter directories. Defaults to --output-dir or cache/results.",
+    )
+    parser.add_argument("--checkpoint-eval-output-dir", type=Path, default=None)
+    parser.add_argument("--checkpoint-eval-metric", default="acc_norm")
     parser.add_argument("--eval-tasks", default="arc_challenge")
     parser.add_argument("--num-fewshot", type=int, default=25)
     parser.add_argument("--eval-batch-size", default="8")
@@ -187,6 +207,12 @@ def parse_args() -> argparse.Namespace:
         args.eval_peft_path = args.eval_peft_path.expanduser().resolve()
     if args.eval_output_path is not None:
         args.eval_output_path = args.eval_output_path.expanduser().resolve()
+    if args.eval_checkpoint_paths is not None:
+        args.eval_checkpoint_paths = [path.expanduser().resolve() for path in args.eval_checkpoint_paths]
+    if args.eval_checkpoint_dir is not None:
+        args.eval_checkpoint_dir = args.eval_checkpoint_dir.expanduser().resolve()
+    if args.checkpoint_eval_output_dir is not None:
+        args.checkpoint_eval_output_dir = args.checkpoint_eval_output_dir.expanduser().resolve()
     if args.best_eval_output_dir is not None:
         args.best_eval_output_dir = args.best_eval_output_dir.expanduser().resolve()
     return args
@@ -1028,6 +1054,107 @@ def run_lm_eval_for_checkpoint(
     subprocess.run(cmd, check=True)
 
 
+def get_checkpoint_eval_root(args: argparse.Namespace) -> Path:
+    return args.eval_checkpoint_dir or get_default_output_dir(args)
+
+
+def get_checkpoint_eval_output_root(args: argparse.Namespace) -> Path:
+    if args.checkpoint_eval_output_dir:
+        return args.checkpoint_eval_output_dir
+    return get_default_output_dir(args) / f"checkpoint_{args.num_fewshot}shot_eval" / f"run-{int(time.time())}"
+
+
+def resolve_checkpoint_eval_targets(args: argparse.Namespace) -> tuple[list[Path], str]:
+    if args.eval_checkpoint_paths:
+        checkpoints = args.eval_checkpoint_paths
+        missing = [path for path in checkpoints if not path.exists()]
+        if missing:
+            raise FileNotFoundError(
+                "Some checkpoint paths do not exist:\n" + "\n".join(str(path) for path in missing)
+            )
+
+        invalid = [path for path in checkpoints if not (path / "adapter_config.json").exists()]
+        if invalid:
+            raise FileNotFoundError(
+                "Some checkpoint paths do not contain adapter_config.json:\n"
+                + "\n".join(str(path) for path in invalid)
+            )
+        return checkpoints, "selected checkpoint paths"
+
+    checkpoint_root = get_checkpoint_eval_root(args)
+    if not checkpoint_root.exists():
+        raise FileNotFoundError(f"Checkpoint directory does not exist: {checkpoint_root}")
+
+    all_checkpoints = list_checkpoint_dirs(checkpoint_root)
+    checkpoints = [path for path in all_checkpoints if (path / "adapter_config.json").exists()]
+    skipped = [path for path in all_checkpoints if path not in checkpoints]
+    if skipped:
+        print("Skipping checkpoints without adapter_config.json:")
+        for checkpoint in skipped:
+            print(f"- {checkpoint}")
+    if not checkpoints:
+        raise RuntimeError(f"No adapter checkpoints found under: {checkpoint_root}")
+    return checkpoints, str(checkpoint_root)
+
+
+def run_checkpoint_evals(args: argparse.Namespace) -> None:
+    if args.push_to_hub:
+        raise ValueError("--eval-checkpoints cannot be combined with --push-to-hub.")
+
+    checkpoints, checkpoint_source = resolve_checkpoint_eval_targets(args)
+    base_model_path = resolve_adapter_eval_base_model(args, base_model_path=None)
+    eval_root = get_checkpoint_eval_output_root(args)
+    eval_root.mkdir(parents=True, exist_ok=True)
+
+    task = args.eval_tasks.split(",")[0].strip()
+    records: list[dict[str, Any]] = []
+    for checkpoint in checkpoints:
+        if args.eval_log_samples:
+            output_path = eval_root / checkpoint.name
+        else:
+            output_path = eval_root / checkpoint.name / f"result-{args.num_fewshot}shot.json"
+        run_single_eval(
+            args,
+            f"{checkpoint.name}_{args.num_fewshot}shot",
+            base_model_path,
+            output_path,
+            peft_path=checkpoint,
+        )
+        result, result_file = load_lm_eval_result(output_path)
+        metric_value = extract_lm_eval_metric(result, task, args.checkpoint_eval_metric)
+        epoch = get_checkpoint_epoch(checkpoint)
+        record = {
+            "checkpoint_path": str(checkpoint),
+            "epoch": epoch,
+            "task": task,
+            "metric": args.checkpoint_eval_metric,
+            "metric_value": metric_value,
+            "num_fewshot": args.num_fewshot,
+            "result_file": str(result_file),
+        }
+        records.append(record)
+        print(f"{checkpoint.name}: {args.checkpoint_eval_metric}={metric_value:.6f}")
+
+    best_record = max(records, key=lambda item: item["metric_value"])
+    summary = {
+        "checkpoint_source": checkpoint_source,
+        "base_model_path": base_model_path,
+        "best_checkpoint_path": best_record["checkpoint_path"],
+        "best_metric_value": best_record["metric_value"],
+        "selection_metric": args.checkpoint_eval_metric,
+        "eval_tasks": args.eval_tasks,
+        "num_fewshot": args.num_fewshot,
+        "records": records,
+    }
+    summary_path = eval_root / "checkpoint_eval_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"Checkpoint evaluation summary saved to: {summary_path}")
+    print(
+        "Best checkpoint: "
+        f"{best_record['checkpoint_path']} ({args.checkpoint_eval_metric}={best_record['metric_value']:.6f})"
+    )
+
+
 def load_lm_eval_result(output_path: Path) -> tuple[dict[str, Any], Path]:
     candidates = [output_path] if output_path.is_file() else sorted(
         output_path.rglob("*.json"),
@@ -1222,6 +1349,9 @@ def main() -> None:
 
     if args.eval_only:
         maybe_login(args.hf_token)
+        if args.eval_checkpoints:
+            run_checkpoint_evals(args)
+            return
         eval_info = run_eval(args, final_output_dir=None)
         handle_finetuned_artifacts(args, eval_info)
         return

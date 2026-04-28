@@ -208,6 +208,42 @@ evaluation. For baseline evaluation it is
 Inside that directory, `lm_eval` writes the aggregate result plus a task-level
 sample file that can be filtered for correct and incorrect ARC examples.
 
+To evaluate only selected saved checkpoints with 25-shot ARC Challenge:
+
+```bash
+python run_mistral_arc_experiment.py \
+  --cache-dir /tmp/huggingface_cache \
+  --eval-only \
+  --eval-checkpoints \
+  --eval-checkpoint-paths \
+    /tmp/huggingface_cache/results/checkpoint-120 \
+    /tmp/huggingface_cache/results/checkpoint-240 \
+  --num-fewshot 25
+```
+
+Each selected checkpoint directory is evaluated as
+`pretrained=base,peft=checkpoint`. By default, result JSON files and
+`checkpoint_eval_summary.json` are written under:
+
+```bash
+/tmp/huggingface_cache/results/checkpoint_25shot_eval/
+```
+
+Use `--checkpoint-eval-output-dir /path/to/eval-results` to choose a different
+output directory.
+
+If you intentionally want to evaluate every checkpoint under a directory, omit
+`--eval-checkpoint-paths` and use:
+
+```bash
+python run_mistral_arc_experiment.py \
+  --cache-dir /tmp/huggingface_cache \
+  --eval-only \
+  --eval-checkpoints \
+  --eval-checkpoint-dir /tmp/huggingface_cache/results \
+  --num-fewshot 25
+```
+
 ## Optional Hub push
 
 Pushing is disabled by default to avoid accidental uploads. Training runs save
