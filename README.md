@@ -8,7 +8,7 @@ Default experiment:
 - Base model: `mistralai/Mistral-7B-v0.1`
 - Dataset: `tatsu-lab/alpaca`, `train` split by default
 - Sampling: 500 examples after `shuffle(seed=42)`
-- Optional MCQA training data: ARC, SciQ, and OpenBookQA train splits
+- Optional MCQA training data: ARC, SciQA, and OpenBookQA train splits
 - Fine-tuning: QLoRA, `r=8`, `lora_alpha=16`, `target_modules=["q_proj", "v_proj"]`
 - Training: 1 epoch, batch size 4, learning rate `2e-4`, max length 1024
 - Precision: auto bf16 on supported GPUs such as A100, otherwise fp16
@@ -105,13 +105,13 @@ python run_mistral_arc_experiment.py \
   --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-alpaca-arc-adapter
 ```
 
-To train on SciQ:
+To train on SciQA:
 
 ```bash
 python run_mistral_arc_experiment.py \
   --cache-dir /tmp/huggingface_cache \
-  --train-dataset sciq \
-  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-sciq-adapter
+  --train-dataset sciqa \
+  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-sciqa-adapter
 ```
 
 To train on OpenBookQA:
@@ -123,13 +123,13 @@ python run_mistral_arc_experiment.py \
   --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-openbookqa-adapter
 ```
 
-To train on both SciQ and OpenBookQA:
+To train on both SciQA and OpenBookQA:
 
 ```bash
 python run_mistral_arc_experiment.py \
   --cache-dir /tmp/huggingface_cache \
-  --train-dataset sciq_openbookqa \
-  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-sciq-openbookqa-adapter
+  --train-dataset sciqa_openbookqa \
+  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-sciqa-openbookqa-adapter
 ```
 
 MCQA dataset options:
@@ -137,19 +137,19 @@ MCQA dataset options:
 - `--arc-configs ARC-Easy ARC-Challenge` controls which ARC subsets are loaded.
 - `--arc-split train` controls the ARC split.
 - `--arc-sample-size 0` means use all combined ARC examples. Set a positive number to sample after combining and shuffling.
-- `--sciq-dataset-id allenai/sciq` controls the SciQ dataset id. `--train-dataset sciqa` is accepted as an alias for `sciq`.
-- `--sciq-split train` controls the SciQ split.
-- `--sciq-sample-size 0` means use all SciQ examples. Set a positive number to sample after shuffling.
+- `--sciqa-dataset-id allenai/sciq` controls the SciQA dataset id. The old `--sciq-dataset-id` spelling is still accepted.
+- `--sciqa-split train` controls the SciQA split. The old `--sciq-split` spelling is still accepted.
+- `--sciqa-sample-size 0` means use all SciQA examples. The old `--sciq-sample-size` spelling is still accepted.
 - `--openbookqa-dataset-id allenai/openbookqa` controls the OpenBookQA dataset id.
 - `--openbookqa-configs main` controls which OpenBookQA configs are loaded. Use `main additional` to combine both.
 - `--openbookqa-split train` controls the OpenBookQA split.
 - `--openbookqa-sample-size 0` means use all combined OpenBookQA examples. Set a positive number to sample after combining and shuffling.
 - `--arc-format question_answer` keeps the original format: `{question} Answer: {answer_text}`.
-- `--arc-format question_choices_answer` uses `{question}\nChoices:\nA. ...\nB. ...\nAnswer: {answer_text}` for ARC, SciQ, and OpenBookQA.
-- `--train-dataset science_qa` is an alias for `sciq_openbookqa`.
-- `--train-dataset sciqa_openbookqa` is accepted as an alias for `sciq_openbookqa`.
-- `--train-dataset arc_sciq_openbookqa` combines ARC, SciQ, and OpenBookQA.
-- `--train-dataset all` combines Alpaca, ARC, SciQ, and OpenBookQA.
+- `--arc-format question_choices_answer` uses `{question}\nChoices:\nA. ...\nB. ...\nAnswer: {answer_text}` for ARC, SciQA, and OpenBookQA.
+- `--train-dataset sciq`, `sicq`, `sicqa`, and `science_qa` are accepted as deprecated aliases for `sciqa`.
+- `--train-dataset sciqa_openbookqa` combines SciQA and OpenBookQA.
+- `--train-dataset arc_sciqa_openbookqa` combines ARC, SciQA, and OpenBookQA.
+- `--train-dataset all` combines Alpaca, ARC, SciQA, and OpenBookQA.
 
 To evaluate the original Mistral-7B baseline instead of the fine-tuned model:
 

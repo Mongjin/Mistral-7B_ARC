@@ -26,10 +26,32 @@ from trl import SFTConfig, SFTTrainer
 DEFAULT_MODEL_ID = "mistralai/Mistral-7B-v0.1"
 DEFAULT_DATASET_ID = "tatsu-lab/alpaca"
 DEFAULT_ARC_DATASET_ID = "allenai/ai2_arc"
-DEFAULT_SCIQ_DATASET_ID = "allenai/sciq"
+DEFAULT_SCIQA_DATASET_ID = "allenai/sciq"
 DEFAULT_OPENBOOKQA_DATASET_ID = "allenai/openbookqa"
 DEFAULT_MODEL_NAME = "mistral-7b-qlora-alpaca-sample-0.5k"
 TRAIN_COLUMNS = ["instruction", "input", "output", "text", "source"]
+TRAIN_DATASET_SOURCES = {
+    "alpaca": {"alpaca"},
+    "arc": {"arc"},
+    "sciqa": {"sciqa"},
+    "openbookqa": {"openbookqa"},
+    "alpaca_arc": {"alpaca", "arc"},
+    "sciqa_openbookqa": {"sciqa", "openbookqa"},
+    "arc_sciqa_openbookqa": {"arc", "sciqa", "openbookqa"},
+    "all": {"alpaca", "arc", "sciqa", "openbookqa"},
+}
+TRAIN_DATASET_ALIASES = {
+    "sciq": "sciqa",
+    "sicq": "sciqa",
+    "sicqa": "sciqa",
+    "science_qa": "sciqa",
+    "scienceqa": "sciqa",
+    "sciq_openbookqa": "sciqa_openbookqa",
+    "sicqa_openbookqa": "sciqa_openbookqa",
+    "science_qa_openbookqa": "sciqa_openbookqa",
+    "arc_sciq_openbookqa": "arc_sciqa_openbookqa",
+    "arc_sicqa_openbookqa": "arc_sciqa_openbookqa",
+}
 HUB_ADAPTER_IGNORE_PATTERNS = [
     "optimizer.pt",
     "scheduler.pt",
@@ -51,20 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument(
         "--train-dataset",
-        choices=[
-            "alpaca",
-            "arc",
-            "sciq",
-            "sciqa",
-            "openbookqa",
-            "alpaca_arc",
-            "sciq_openbookqa",
-            "sciqa_openbookqa",
-            "science_qa",
-            "arc_sciq_openbookqa",
-            "all",
-        ],
         default="alpaca",
+        metavar="{alpaca,arc,sciqa,openbookqa,alpaca_arc,sciqa_openbookqa,arc_sciqa_openbookqa,all}",
         help="Training data source. MCQA datasets share --arc-format prompt formatting.",
     )
     parser.add_argument("--dataset-id", default=DEFAULT_DATASET_ID)
@@ -76,7 +86,7 @@ def parse_args() -> argparse.Namespace:
         "--arc-format",
         choices=["question_answer", "question_choices_answer"],
         default="question_answer",
-        help="MCQA SFT prompt format for ARC, SciQ, and OpenBookQA.",
+        help="MCQA SFT prompt format for ARC, SciQA, and OpenBookQA.",
     )
     parser.add_argument(
         "--arc-sample-size",
@@ -84,13 +94,15 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Number of combined ARC examples to use. Use 0 or a negative value for all ARC train examples.",
     )
-    parser.add_argument("--sciq-dataset-id", default=DEFAULT_SCIQ_DATASET_ID)
-    parser.add_argument("--sciq-split", default="train")
+    parser.add_argument("--sciqa-dataset-id", "--sciq-dataset-id", dest="sciqa_dataset_id", default=DEFAULT_SCIQA_DATASET_ID)
+    parser.add_argument("--sciqa-split", "--sciq-split", dest="sciqa_split", default="train")
     parser.add_argument(
+        "--sciqa-sample-size",
         "--sciq-sample-size",
+        dest="sciqa_sample_size",
         type=int,
         default=0,
-        help="Number of SciQ examples to use. Use 0 or a negative value for all SciQ train examples.",
+        help="Number of SciQA examples to use. Use 0 or a negative value for all SciQA train examples.",
     )
     parser.add_argument("--openbookqa-dataset-id", default=DEFAULT_OPENBOOKQA_DATASET_ID)
     parser.add_argument("--openbookqa-configs", nargs="+", default=["main"])
@@ -224,6 +236,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
+    args.train_dataset = normalize_train_dataset(args.train_dataset)
     args.cache_dir = args.cache_dir.expanduser().resolve()
     if args.base_local_dir is not None:
         args.base_local_dir = args.base_local_dir.expanduser().resolve()
@@ -248,6 +261,16 @@ def parse_args() -> argparse.Namespace:
     if args.best_eval_output_dir is not None:
         args.best_eval_output_dir = args.best_eval_output_dir.expanduser().resolve()
     return args
+
+
+def normalize_train_dataset(train_dataset: str) -> str:
+    normalized = TRAIN_DATASET_ALIASES.get(train_dataset, train_dataset)
+    if normalized not in TRAIN_DATASET_SOURCES:
+        valid_names = ", ".join(TRAIN_DATASET_SOURCES)
+        raise ValueError(f"Unsupported --train-dataset {train_dataset!r}. Use one of: {valid_names}.")
+    if normalized != train_dataset:
+        print(f"Normalizing --train-dataset {train_dataset!r} to {normalized!r}.")
+    return normalized
 
 
 def ensure_cuda() -> None:
@@ -428,7 +451,7 @@ def format_arc_example(example: dict[str, Any], arc_format: str = "question_answ
     }
 
 
-def format_sciq_example(
+def format_sciqa_example(
     example: dict[str, Any],
     index: int,
     arc_format: str = "question_answer",
@@ -456,7 +479,7 @@ def format_sciq_example(
         "input": prompt,
         "output": answer_text,
         "text": text,
-        "source": "sciq",
+        "source": "sciqa",
     }
 
 
@@ -527,18 +550,18 @@ def load_arc_training_dataset(args: argparse.Namespace):
     return dataset
 
 
-def load_sciq_training_dataset(args: argparse.Namespace):
+def load_sciqa_training_dataset(args: argparse.Namespace):
     dataset = load_dataset(
-        args.sciq_dataset_id,
-        split=args.sciq_split,
+        args.sciqa_dataset_id,
+        split=args.sciqa_split,
         cache_dir=str(args.cache_dir),
     )
     dataset = dataset.map(
-        format_sciq_example,
+        format_sciqa_example,
         with_indices=True,
         fn_kwargs={"arc_format": args.arc_format, "seed": args.seed},
     ).select_columns(TRAIN_COLUMNS)
-    dataset = sample_dataset(dataset, args.sciq_sample_size, args.seed, "SciQ")
+    dataset = sample_dataset(dataset, args.sciqa_sample_size, args.seed, "SciQA")
     return dataset
 
 
@@ -564,20 +587,7 @@ def load_openbookqa_training_dataset(args: argparse.Namespace):
 
 
 def get_training_sources(train_dataset: str) -> set[str]:
-    source_map = {
-        "alpaca": {"alpaca"},
-        "arc": {"arc"},
-        "sciq": {"sciq"},
-        "sciqa": {"sciq"},
-        "openbookqa": {"openbookqa"},
-        "alpaca_arc": {"alpaca", "arc"},
-        "sciq_openbookqa": {"sciq", "openbookqa"},
-        "sciqa_openbookqa": {"sciq", "openbookqa"},
-        "science_qa": {"sciq", "openbookqa"},
-        "arc_sciq_openbookqa": {"arc", "sciq", "openbookqa"},
-        "all": {"alpaca", "arc", "sciq", "openbookqa"},
-    }
-    return source_map[train_dataset]
+    return TRAIN_DATASET_SOURCES[train_dataset]
 
 
 def load_training_dataset(args: argparse.Namespace):
@@ -587,8 +597,8 @@ def load_training_dataset(args: argparse.Namespace):
         datasets.append(load_alpaca_training_dataset(args))
     if "arc" in sources:
         datasets.append(load_arc_training_dataset(args))
-    if "sciq" in sources:
-        datasets.append(load_sciq_training_dataset(args))
+    if "sciqa" in sources:
+        datasets.append(load_sciqa_training_dataset(args))
     if "openbookqa" in sources:
         datasets.append(load_openbookqa_training_dataset(args))
 
