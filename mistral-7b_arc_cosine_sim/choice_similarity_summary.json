@@ -1,0 +1,74 @@
+[
+  {
+    "dataset": "arc",
+    "split": "test",
+    "num_examples": 3548,
+    "num_pairs": 21283,
+    "mean_example_mean_cosine": 0.4499214174187735,
+    "median_example_mean_cosine": 0.41125775625308353,
+    "q25_example_mean_cosine": 0.30943413680264104,
+    "q75_example_mean_cosine": 0.5702284425497055,
+    "pairwise_mean_cosine": 0.4498582782698562,
+    "pairwise_median_cosine": 0.4234945774078369
+  },
+  {
+    "dataset": "arc",
+    "split": "train",
+    "num_examples": 3370,
+    "num_pairs": 20219,
+    "mean_example_mean_cosine": 0.44394618367922606,
+    "median_example_mean_cosine": 0.4131287087996801,
+    "q25_example_mean_cosine": 0.3069687473277251,
+    "q75_example_mean_cosine": 0.5609508628646532,
+    "pairwise_mean_cosine": 0.44387073832837615,
+    "pairwise_median_cosine": 0.42033305764198303
+  },
+  {
+    "dataset": "openbookqa",
+    "split": "test",
+    "num_examples": 500,
+    "num_pairs": 3000,
+    "mean_example_mean_cosine": 0.3499780512014405,
+    "median_example_mean_cosine": 0.3289792214830717,
+    "q25_example_mean_cosine": 0.26114743668586016,
+    "q75_example_mean_cosine": 0.42668865496913594,
+    "pairwise_mean_cosine": 0.3499780512014404,
+    "pairwise_median_cosine": 0.33187659084796906
+  },
+  {
+    "dataset": "openbookqa",
+    "split": "train",
+    "num_examples": 4957,
+    "num_pairs": 29742,
+    "mean_example_mean_cosine": 0.3273877593257857,
+    "median_example_mean_cosine": 0.3053012515107791,
+    "q25_example_mean_cosine": 0.23086984703938165,
+    "q75_example_mean_cosine": 0.3942688008149465,
+    "pairwise_mean_cosine": 0.32738775932578573,
+    "pairwise_median_cosine": 0.2996230274438858
+  },
+  {
+    "dataset": "sciqa",
+    "split": "test",
+    "num_examples": 1000,
+    "num_pairs": 6000,
+    "mean_example_mean_cosine": 0.40008812323748133,
+    "median_example_mean_cosine": 0.3708670685688655,
+    "q25_example_mean_cosine": 0.2997537632084762,
+    "q75_example_mean_cosine": 0.48078721140821773,
+    "pairwise_mean_cosine": 0.40008812323748133,
+    "pairwise_median_cosine": 0.37640246748924255
+  },
+  {
+    "dataset": "sciqa",
+    "split": "train",
+    "num_examples": 11679,
+    "num_pairs": 70074,
+    "mean_example_mean_cosine": 0.40377802271648283,
+    "median_example_mean_cosine": 0.3784540345271428,
+    "q25_example_mean_cosine": 0.300927517314752,
+    "q75_example_mean_cosine": 0.4860621839761734,
+    "pairwise_mean_cosine": 0.40377802271648244,
+    "pairwise_median_cosine": 0.3824043571949005
+  }
+]
