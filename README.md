@@ -360,6 +360,32 @@ HF_TOKEN=your_token_here python run_mistral_arc_experiment.py \
   --push-to-hub
 ```
 
+## Choice Similarity Analysis
+
+Use `analyze_choice_similarity.py` to compare how semantically similar answer
+choices are within each multiple-choice question for ARC, SciQA, and
+OpenBookQA:
+
+```bash
+python analyze_choice_similarity.py \
+  --cache-dir /tmp/huggingface_cache \
+  --output-dir /tmp/huggingface_cache/choice_similarity \
+  --datasets arc sciqa openbookqa \
+  --splits train test
+```
+
+The script embeds unique answer choice texts once with
+`sentence-transformers/all-MiniLM-L6-v2`, computes pairwise cosine similarity
+within each question, and writes:
+
+- `choice_similarity_records.csv` with per-question similarity statistics.
+- `choice_similarity_summary.json` with dataset/split summary statistics.
+- `dataset_comparison.png` comparing all datasets at a glance.
+- `{dataset}_train_test_similarity.png` comparing train/test for each dataset.
+
+For a quick smoke test, add `--sample-size 200`. To save every individual
+choice-pair cosine value, add `--save-pairwise-csv`.
+
 ## Useful A100 options
 
 The script follows the notebook's auto precision behavior. On A100 it uses bf16
