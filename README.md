@@ -96,6 +96,25 @@ python run_mistral_arc_experiment.py \
   --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-choices-adapter
 ```
 
+To train with a choice-contrastive MCQA loss instead of standard SFT loss:
+
+```bash
+python run_mistral_arc_experiment.py \
+  --cache-dir /tmp/huggingface_cache \
+  --train-dataset arc \
+  --arc-format question_choices_answer \
+  --loss-type choice_contrastive \
+  --choice-loss-temperature 1.0 \
+  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-choice-loss-adapter
+```
+
+This loss scores every answer choice as a continuation of the same prompt and
+optimizes `-log softmax(log P(answer | prompt) / tau)` for the correct answer.
+Use `--choice-loss-length-normalize` if you want the contrastive score to use
+average token log-probability, which is closer to `acc_norm`. The contrastive
+loss requires multiple-choice examples, so do not use it with Alpaca-containing
+datasets such as `alpaca`, `alpaca_arc`, or `all`.
+
 To mix the original 500 Alpaca samples with all ARC train examples:
 
 ```bash

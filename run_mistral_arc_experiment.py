@@ -19,7 +19,7 @@ import torch
 from datasets import concatenate_datasets, load_dataset
 from huggingface_hub import HfApi, login, snapshot_download
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, set_seed
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, Trainer, set_seed
 from trl import SFTConfig, SFTTrainer
 
 
@@ -30,6 +30,8 @@ DEFAULT_SCIQA_DATASET_ID = "allenai/sciq"
 DEFAULT_OPENBOOKQA_DATASET_ID = "allenai/openbookqa"
 DEFAULT_MODEL_NAME = "mistral-7b-qlora-alpaca-sample-0.5k"
 TRAIN_COLUMNS = ["instruction", "input", "output", "text", "source"]
+CHOICE_COLUMNS = ["choice_prompt", "choice_texts", "correct_choice_index"]
+DATASET_COLUMNS = TRAIN_COLUMNS + CHOICE_COLUMNS
 TRAIN_DATASET_SOURCES = {
     "alpaca": {"alpaca"},
     "arc": {"arc"},
@@ -142,6 +144,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=0.001)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
+    parser.add_argument(
+        "--loss-type",
+        choices=["sft", "choice_contrastive"],
+        default="sft",
+        help="Use standard SFT loss or MCQA choice-contrastive loss over correct/wrong answer choices.",
+    )
+    parser.add_argument(
+        "--choice-loss-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature tau for choice_contrastive loss.",
+    )
+    parser.add_argument(
+        "--choice-loss-length-normalize",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Average answer log-prob by answer length before contrastive softmax. Useful when targeting acc_norm.",
+    )
     parser.add_argument("--save-strategy", choices=["steps", "epoch", "no"], default="steps")
     parser.add_argument("--save-steps", type=int, default=50)
     parser.add_argument("--resume-from-checkpoint", type=Path, default=None)
@@ -237,6 +257,8 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
     args.train_dataset = normalize_train_dataset(args.train_dataset)
+    if args.choice_loss_temperature <= 0:
+        raise ValueError("--choice-loss-temperature must be positive.")
     args.cache_dir = args.cache_dir.expanduser().resolve()
     if args.base_local_dir is not None:
         args.base_local_dir = args.base_local_dir.expanduser().resolve()
@@ -407,6 +429,9 @@ def format_alpaca_example(example: dict[str, Any]) -> dict[str, str]:
         "output": output,
         "text": text,
         "source": "alpaca",
+        "choice_prompt": "",
+        "choice_texts": [],
+        "correct_choice_index": -1,
     }
 
 
@@ -429,12 +454,21 @@ def format_mcqa_text(
     return prompt, answer_text, text
 
 
+def make_choice_fields(prompt: str, choice_texts: list[str], correct_choice_index: int) -> dict[str, Any]:
+    return {
+        "choice_prompt": f"Question: {prompt}",
+        "choice_texts": [f" {choice_text}" for choice_text in choice_texts],
+        "correct_choice_index": correct_choice_index,
+    }
+
+
 def format_arc_example(example: dict[str, Any], arc_format: str = "question_answer") -> dict[str, str]:
     choices = example["choices"]
     labels = [str(label) for label in choices["label"]]
     texts = [str(text) for text in choices["text"]]
     answer = str(example["answerKey"])
-    answer_text = texts[labels.index(answer)] if answer in labels else answer
+    correct_choice_index = labels.index(answer) if answer in labels else -1
+    answer_text = texts[correct_choice_index] if correct_choice_index >= 0 else answer
     prompt, answer_text, text = format_mcqa_text(
         str(example["question"]),
         str(answer_text),
@@ -448,6 +482,7 @@ def format_arc_example(example: dict[str, Any], arc_format: str = "question_answ
         "output": answer_text,
         "text": text,
         "source": "arc",
+        **make_choice_fields(prompt, texts, correct_choice_index),
     }
 
 
@@ -467,6 +502,7 @@ def format_sciqa_example(
     rng = random.Random(f"{seed}:{index}:{example['question']}")
     rng.shuffle(choice_texts)
     labels = ["A", "B", "C", "D"]
+    correct_choice_index = choice_texts.index(correct_answer)
     prompt, answer_text, text = format_mcqa_text(
         str(example["question"]),
         correct_answer,
@@ -480,6 +516,7 @@ def format_sciqa_example(
         "output": answer_text,
         "text": text,
         "source": "sciqa",
+        **make_choice_fields(prompt, choice_texts, correct_choice_index),
     }
 
 
@@ -492,7 +529,8 @@ def format_openbookqa_example(
     labels = [str(label) for label in choices["label"]]
     texts = [str(text) for text in choices["text"]]
     answer = str(example["answerKey"])
-    answer_text = texts[labels.index(answer)] if answer in labels else answer
+    correct_choice_index = labels.index(answer) if answer in labels else -1
+    answer_text = texts[correct_choice_index] if correct_choice_index >= 0 else answer
     prompt, answer_text, text = format_mcqa_text(
         str(example["question_stem"]),
         str(answer_text),
@@ -506,6 +544,7 @@ def format_openbookqa_example(
         "output": answer_text,
         "text": text,
         "source": source,
+        **make_choice_fields(prompt, texts, correct_choice_index),
     }
 
 
@@ -528,7 +567,7 @@ def load_alpaca_training_dataset(args: argparse.Namespace):
         cache_dir=str(args.cache_dir),
     )
     dataset = sample_dataset(dataset, args.sample_size, args.seed, "Alpaca")
-    return dataset.map(format_alpaca_example).select_columns(TRAIN_COLUMNS)
+    return dataset.map(format_alpaca_example).select_columns(DATASET_COLUMNS)
 
 
 def load_arc_training_dataset(args: argparse.Namespace):
@@ -540,7 +579,7 @@ def load_arc_training_dataset(args: argparse.Namespace):
             split=args.arc_split,
             cache_dir=str(args.cache_dir),
         )
-        dataset = dataset.map(format_arc_example, fn_kwargs={"arc_format": args.arc_format}).select_columns(TRAIN_COLUMNS)
+        dataset = dataset.map(format_arc_example, fn_kwargs={"arc_format": args.arc_format}).select_columns(DATASET_COLUMNS)
         dataset = dataset.remove_columns("source").add_column("source", [config] * len(dataset))
         arc_datasets.append(dataset)
         print(f"Loaded {len(dataset)} examples from {args.arc_dataset_id}/{config}/{args.arc_split}.")
@@ -560,7 +599,7 @@ def load_sciqa_training_dataset(args: argparse.Namespace):
         format_sciqa_example,
         with_indices=True,
         fn_kwargs={"arc_format": args.arc_format, "seed": args.seed},
-    ).select_columns(TRAIN_COLUMNS)
+    ).select_columns(DATASET_COLUMNS)
     dataset = sample_dataset(dataset, args.sciqa_sample_size, args.seed, "SciQA")
     return dataset
 
@@ -577,7 +616,7 @@ def load_openbookqa_training_dataset(args: argparse.Namespace):
         dataset = dataset.map(
             format_openbookqa_example,
             fn_kwargs={"arc_format": args.arc_format, "source": f"openbookqa-{config}"},
-        ).select_columns(TRAIN_COLUMNS)
+        ).select_columns(DATASET_COLUMNS)
         openbookqa_datasets.append(dataset)
         print(f"Loaded {len(dataset)} examples from {args.openbookqa_dataset_id}/{config}/{args.openbookqa_split}.")
 
@@ -610,7 +649,34 @@ def load_training_dataset(args: argparse.Namespace):
     print(dataset)
     print("First formatted sample:")
     print(dataset[0]["text"])
+    validate_choice_contrastive_dataset(args, dataset, sources)
     return dataset
+
+
+def validate_choice_contrastive_dataset(args: argparse.Namespace, dataset, sources: set[str]) -> None:
+    if args.loss_type != "choice_contrastive":
+        return
+    if "alpaca" in sources:
+        raise ValueError(
+            "--loss-type choice_contrastive requires multiple-choice datasets only. "
+            "Use arc, sciqa, openbookqa, sciqa_openbookqa, or arc_sciqa_openbookqa."
+        )
+
+    invalid_examples: list[str] = []
+    for idx in range(len(dataset)):
+        row = dataset[idx]
+        choice_texts = row.get("choice_texts") or []
+        correct_index = int(row.get("correct_choice_index", -1))
+        if not choice_texts or correct_index < 0 or correct_index >= len(choice_texts):
+            invalid_examples.append(f"idx={idx}, source={row.get('source')}, correct_choice_index={correct_index}")
+            if len(invalid_examples) >= 5:
+                break
+
+    if invalid_examples:
+        raise ValueError(
+            "choice_contrastive loss found examples without valid answer choices:\n"
+            + "\n".join(invalid_examples)
+        )
 
 
 def load_model_and_tokenizer(args: argparse.Namespace, model_path: str):
@@ -751,6 +817,8 @@ def make_sft_config(args: argparse.Namespace) -> SFTConfig:
         "packing": args.packing,
         "report_to": args.report_to,
     }
+    if args.loss_type == "choice_contrastive":
+        config_kwargs["remove_unused_columns"] = False
 
     fields = getattr(SFTConfig, "__dataclass_fields__", {})
     if "max_length" in fields:
@@ -763,7 +831,134 @@ def make_sft_config(args: argparse.Namespace) -> SFTConfig:
     return SFTConfig(**config_kwargs)
 
 
-def make_trainer(model, tokenizer, dataset, training_args: SFTConfig) -> SFTTrainer:
+class ChoiceContrastiveDataCollator:
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "choice_prompt": [feature["choice_prompt"] for feature in features],
+            "choice_texts": [list(feature["choice_texts"]) for feature in features],
+            "correct_choice_index": torch.tensor(
+                [int(feature["correct_choice_index"]) for feature in features],
+                dtype=torch.long,
+            ),
+        }
+
+
+class ChoiceContrastiveTrainer(Trainer):
+    def __init__(
+        self,
+        *args,
+        choice_tokenizer,
+        choice_loss_temperature: float,
+        choice_loss_length_normalize: bool,
+        max_length: int,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.choice_tokenizer = choice_tokenizer
+        self.choice_loss_temperature = choice_loss_temperature
+        self.choice_loss_length_normalize = choice_loss_length_normalize
+        self.choice_max_length = max_length
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        prompts: list[str] = inputs["choice_prompt"]
+        choice_texts: list[list[str]] = inputs["choice_texts"]
+        correct_choice_index = inputs["correct_choice_index"].to(model.device)
+
+        choice_counts = [len(choices) for choices in choice_texts]
+        if any(count <= 1 for count in choice_counts):
+            raise ValueError("choice_contrastive loss requires at least two choices for every example.")
+
+        flat_prompts: list[str] = []
+        flat_choices: list[str] = []
+        for prompt, choices in zip(prompts, choice_texts):
+            flat_prompts.extend([prompt] * len(choices))
+            flat_choices.extend(choices)
+
+        flat_scores = self._compute_flat_choice_scores(model, flat_prompts, flat_choices)
+        max_choices = max(choice_counts)
+        choice_scores = flat_scores.new_full((len(choice_counts), max_choices), -torch.inf)
+
+        offset = 0
+        for row_idx, count in enumerate(choice_counts):
+            choice_scores[row_idx, :count] = flat_scores[offset : offset + count]
+            offset += count
+
+        if torch.any(correct_choice_index >= torch.tensor(choice_counts, device=model.device)):
+            raise ValueError("correct_choice_index is out of range for at least one example.")
+
+        logits = choice_scores / self.choice_loss_temperature
+        loss = torch.nn.functional.cross_entropy(logits, correct_choice_index)
+        return (loss, {"logits": logits}) if return_outputs else loss
+
+    def _compute_flat_choice_scores(self, model, prompts: list[str], choices: list[str]) -> torch.Tensor:
+        prefixes = [f"<s>{prompt}" for prompt in prompts]
+        full_texts = [f"{prefix}{choice}" for prefix, choice in zip(prefixes, choices)]
+
+        prefix_encodings = self.choice_tokenizer(
+            prefixes,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.choice_max_length,
+        )
+        prompt_lengths = torch.tensor(
+            [len(input_ids) for input_ids in prefix_encodings["input_ids"]],
+            device=model.device,
+            dtype=torch.long,
+        )
+
+        encodings = self.choice_tokenizer(
+            full_texts,
+            add_special_tokens=False,
+            padding=True,
+            truncation=True,
+            max_length=self.choice_max_length,
+            return_tensors="pt",
+        ).to(model.device)
+
+        outputs = model(input_ids=encodings["input_ids"], attention_mask=encodings["attention_mask"])
+        logits = outputs.logits[:, :-1, :]
+        target_ids = encodings["input_ids"][:, 1:]
+        target_attention = encodings["attention_mask"][:, 1:].bool()
+
+        positions = torch.arange(target_ids.shape[1], device=model.device).unsqueeze(0)
+        answer_mask = positions >= (prompt_lengths.unsqueeze(1) - 1)
+        answer_mask = answer_mask & target_attention
+        answer_token_counts = answer_mask.sum(dim=1)
+        if torch.any(answer_token_counts == 0):
+            raise ValueError(
+                "At least one answer was truncated away while computing choice_contrastive loss. "
+                "Increase --max-length or shorten the prompt format."
+            )
+
+        token_logprobs = torch.log_softmax(logits, dim=-1).gather(
+            dim=-1,
+            index=target_ids.unsqueeze(-1),
+        ).squeeze(-1)
+        choice_logprobs = (token_logprobs * answer_mask).sum(dim=1)
+        if self.choice_loss_length_normalize:
+            choice_logprobs = choice_logprobs / answer_token_counts
+        return choice_logprobs
+
+
+def make_trainer(model, tokenizer, dataset, training_args: SFTConfig, args: argparse.Namespace) -> Trainer:
+    if args.loss_type == "choice_contrastive":
+        trainer_kwargs: dict[str, Any] = {
+            "model": model,
+            "train_dataset": dataset,
+            "args": training_args,
+            "data_collator": ChoiceContrastiveDataCollator(),
+            "choice_tokenizer": tokenizer,
+            "choice_loss_temperature": args.choice_loss_temperature,
+            "choice_loss_length_normalize": args.choice_loss_length_normalize,
+            "max_length": args.max_length,
+        }
+        signature = inspect.signature(Trainer.__init__)
+        if "processing_class" in signature.parameters:
+            trainer_kwargs["processing_class"] = tokenizer
+        elif "tokenizer" in signature.parameters:
+            trainer_kwargs["tokenizer"] = tokenizer
+        return ChoiceContrastiveTrainer(**trainer_kwargs)
+
     trainer_kwargs: dict[str, Any] = {
         "model": model,
         "train_dataset": dataset,
@@ -1007,7 +1202,7 @@ def train_and_save(args: argparse.Namespace) -> tuple[Path, str, Path | None]:
 
     training_args = make_sft_config(args)
     print_versions()
-    trainer = make_trainer(model, tokenizer, train_dataset, training_args)
+    trainer = make_trainer(model, tokenizer, train_dataset, training_args, args)
     print_training_state(trainer)
 
     output_dir = Path(training_args.output_dir)
