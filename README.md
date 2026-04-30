@@ -1,271 +1,141 @@
-# Mistral-7B ARC QLoRA Experiment
+# Mistral-7B ARC QLoRA Experiments
 
-This repository contains a server-friendly Python script that reproduces the
-notebook experiment in `Mistal-7B_ARC.ipynb`.
+This repo contains two main scripts:
 
-Default experiment:
+- `run_mistral_arc_experiment.py`: QLoRA training, evaluation, adapter save/push.
+- `analyze_choice_similarity.py`: cosine similarity analysis among MCQA answer choices.
 
-- Base model: `mistralai/Mistral-7B-v0.1`
-- Dataset: `tatsu-lab/alpaca`, `train` split by default
-- Sampling: 500 examples after `shuffle(seed=42)`
-- Optional MCQA training data: ARC, SciQA, and OpenBookQA train splits
-- Fine-tuning: QLoRA, `r=8`, `lora_alpha=16`, `target_modules=["q_proj", "v_proj"]`
-- Training: 1 epoch, batch size 4, learning rate `2e-4`, max length 1024
-- Precision: auto bf16 on supported GPUs such as A100, otherwise fp16
-- Best model selection: after training, evaluate each epoch checkpoint with zero-shot `arc_challenge` and save the adapter checkpoint with the highest `acc_norm`
-- Final save: adapter-only by default; use `--save-merged-model` only when a full merged model is needed
-- Evaluation: `lm-evaluation-harness`, `arc_challenge`, 25-shot, batch size 8
+The default base model is `mistralai/Mistral-7B-v0.1`. Training saves LoRA
+adapters by default. A merged full model is saved only when explicitly requested.
 
-## Ubuntu setup
+## Setup
 
-The commands below assume an Ubuntu server with an NVIDIA driver, an A100 GPU,
-Python 3.10 or newer, and a working CUDA-compatible environment.
+Use an Ubuntu server with a CUDA-capable NVIDIA GPU. A100 is recommended.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-
-# Use cu121 by default. Override CUDA_VERSION if your server uses another
-# PyTorch CUDA wheel channel, for example cu124.
 CUDA_VERSION=cu121 bash install.sh
 ```
 
-FlashAttention is optional. If you want to enable it on A100:
+`install.sh` installs PyTorch first with the selected CUDA wheel, then installs
+`requirements.txt`.
+
+If you want FlashAttention:
 
 ```bash
 INSTALL_FLASH_ATTN=1 CUDA_VERSION=cu121 bash install.sh
 ```
 
-If Hugging Face access is required, log in before running:
+For Hugging Face private/gated access or push:
 
 ```bash
+export HF_TOKEN=hf_your_token
+# or
 huggingface-cli login
 ```
 
-Alternatively, set `HF_TOKEN` in the environment.
+## Training Datasets
 
-## Run training and ARC evaluation
+Choose the training data with `--train-dataset`.
+
+- `alpaca`: 500 sampled Alpaca examples by default.
+- `arc`: ARC-Easy + ARC-Challenge train splits.
+- `sciqa`: SciQ/SciQA train split.
+- `openbookqa`: OpenBookQA train split.
+- `alpaca_arc`: Alpaca + ARC.
+- `sciqa_openbookqa`: SciQA + OpenBookQA.
+- `arc_sciqa_openbookqa`: ARC + SciQA + OpenBookQA.
+- `all`: Alpaca + ARC + SciQA + OpenBookQA.
+
+Useful dataset size options:
 
 ```bash
-source .venv/bin/activate
-
-python run_mistral_arc_experiment.py \
-  --cache-dir /tmp/huggingface_cache \
-  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-alpaca-sample-0.5k-adapter
+--sample-size 500
+--arc-sample-size 0
+--sciqa-sample-size 0
+--openbookqa-sample-size 0
 ```
 
-The script trains the LoRA adapter, saves the best adapter checkpoint, clears
-GPU memory, and then runs ARC Challenge evaluation with `pretrained=base,peft=adapter`.
+`0` means use all examples for that MCQA dataset.
 
-By default, the script saves a LoRA checkpoint at every epoch, runs zero-shot
-`lm_eval` on each epoch checkpoint, selects the checkpoint with the highest
-`acc_norm`, and copies that best checkpoint to the final adapter directory. This
-keeps the adapter plus Trainer state needed for resume. The epoch-selection
-summary is written under:
+Prompt format for MCQA datasets:
 
 ```bash
-/tmp/huggingface_cache/results/epoch_zero_shot_eval/
+--arc-format question_answer
+--arc-format question_choices_answer
 ```
 
-Useful best-model selection options:
+`question_answer` uses only the question before `Answer:`.
+`question_choices_answer` also shows all answer choices before `Answer:`.
 
-- `--no-select-best-model` disables epoch-wise zero-shot selection and saves the final epoch model directly.
-- `--best-eval-tasks arc_challenge` controls the zero-shot task used for checkpoint selection.
-- `--best-eval-metric acc_norm` controls the metric used for selection.
-- `--best-eval-batch-size 8` overrides the batch size for epoch-wise zero-shot evaluation.
-- `--best-eval-output-dir /path/to/dir` changes where epoch-wise evaluation JSON files are written.
-- `--resume-from-checkpoint /path/to/checkpoint` resumes training from a saved checkpoint with optimizer/scheduler state.
-- `--save-merged-model` additionally saves a full merged model locally. Hub push is handled from `--eval-only`.
+## Baseline SFT Loss
 
-To train on ARC Easy and ARC Challenge train examples instead of Alpaca:
+Standard SFT trains the model to generate the correct answer text. This is the
+default loss.
 
 ```bash
 python run_mistral_arc_experiment.py \
   --cache-dir /tmp/huggingface_cache \
+  --output-dir /tmp/huggingface_cache/runs/arc_sft \
+  --adapter-output-dir /tmp/huggingface_cache/adapters/arc_sft_best \
   --train-dataset arc \
-  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train-adapter
+  --arc-format question_answer \
+  --loss-type sft
 ```
 
-To train ARC with every answer choice shown before `Answer:`:
+By default, the script saves epoch checkpoints, runs zero-shot `lm_eval`, and
+copies the checkpoint with the best `acc_norm` to `--adapter-output-dir`.
+
+Use a unique `--output-dir` and `--adapter-output-dir` for every experiment to
+avoid checkpoint collisions.
+
+## Contrastive Choice Loss
+
+The contrastive loss compares all answer choices for the same question:
+
+```text
+-log softmax(log P(choice | question) / tau)[correct_choice]
+```
+
+Use it only with MCQA datasets: `arc`, `sciqa`, `openbookqa`,
+`sciqa_openbookqa`, or `arc_sciqa_openbookqa`. Do not use it with Alpaca.
 
 ```bash
 python run_mistral_arc_experiment.py \
   --cache-dir /tmp/huggingface_cache \
+  --output-dir /tmp/huggingface_cache/runs/arc_contrastive \
+  --adapter-output-dir /tmp/huggingface_cache/adapters/arc_contrastive_best \
   --train-dataset arc \
-  --arc-format question_choices_answer \
-  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-choices-adapter
-```
-
-To train with a choice-contrastive MCQA loss instead of standard SFT loss:
-
-```bash
-python run_mistral_arc_experiment.py \
-  --cache-dir /tmp/huggingface_cache \
-  --train-dataset arc \
-  --arc-format question_choices_answer \
+  --arc-format question_answer \
   --loss-type choice_contrastive \
   --choice-loss-temperature 1.0 \
-  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-choice-loss-adapter
+  --choice-loss-length-normalize
 ```
 
-This loss scores every answer choice as a continuation of the same prompt and
-optimizes `-log softmax(log P(answer | prompt) / tau)` for the correct answer.
-Use `--choice-loss-length-normalize` if you want the contrastive score to use
-average token log-probability, which is closer to `acc_norm`. The contrastive
-loss requires multiple-choice examples, so do not use it with Alpaca-containing
-datasets such as `alpaca`, `alpaca_arc`, or `all`.
+`--choice-loss-length-normalize` uses average token log-probability for each
+choice, which is closer to `lm_eval`'s `acc_norm`.
 
-To mix the original 500 Alpaca samples with all ARC train examples:
+## Evaluation
+
+Evaluate the saved best adapter:
 
 ```bash
 python run_mistral_arc_experiment.py \
   --cache-dir /tmp/huggingface_cache \
-  --train-dataset alpaca_arc \
-  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-alpaca-arc-adapter
-```
-
-To train on SciQA:
-
-```bash
-python run_mistral_arc_experiment.py \
-  --cache-dir /tmp/huggingface_cache \
-  --train-dataset sciqa \
-  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-sciqa-adapter
-```
-
-To train on OpenBookQA:
-
-```bash
-python run_mistral_arc_experiment.py \
-  --cache-dir /tmp/huggingface_cache \
-  --train-dataset openbookqa \
-  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-openbookqa-adapter
-```
-
-To train on both SciQA and OpenBookQA:
-
-```bash
-python run_mistral_arc_experiment.py \
-  --cache-dir /tmp/huggingface_cache \
-  --train-dataset sciqa_openbookqa \
-  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-sciqa-openbookqa-adapter
-```
-
-MCQA dataset options:
-
-- `--arc-configs ARC-Easy ARC-Challenge` controls which ARC subsets are loaded.
-- `--arc-split train` controls the ARC split.
-- `--arc-sample-size 0` means use all combined ARC examples. Set a positive number to sample after combining and shuffling.
-- `--sciqa-dataset-id allenai/sciq` controls the SciQA dataset id. The old `--sciq-dataset-id` spelling is still accepted.
-- `--sciqa-split train` controls the SciQA split. The old `--sciq-split` spelling is still accepted.
-- `--sciqa-sample-size 0` means use all SciQA examples. The old `--sciq-sample-size` spelling is still accepted.
-- `--openbookqa-dataset-id allenai/openbookqa` controls the OpenBookQA dataset id.
-- `--openbookqa-configs main` controls which OpenBookQA configs are loaded. Use `main additional` to combine both.
-- `--openbookqa-split train` controls the OpenBookQA split.
-- `--openbookqa-sample-size 0` means use all combined OpenBookQA examples. Set a positive number to sample after combining and shuffling.
-- `--arc-format question_answer` keeps the original format: `{question} Answer: {answer_text}`.
-- `--arc-format question_choices_answer` uses `{question}\nChoices:\nA. ...\nB. ...\nAnswer: {answer_text}` for ARC, SciQA, and OpenBookQA.
-- `--train-dataset sciq`, `sicq`, `sicqa`, and `science_qa` are accepted as deprecated aliases for `sciqa`.
-- `--train-dataset sciqa_openbookqa` combines SciQA and OpenBookQA.
-- `--train-dataset arc_sciqa_openbookqa` combines ARC, SciQA, and OpenBookQA.
-- `--train-dataset all` combines Alpaca, ARC, SciQA, and OpenBookQA.
-
-To evaluate the original Mistral-7B baseline instead of the fine-tuned model:
-
-```bash
-python run_mistral_arc_experiment.py \
-  --cache-dir /tmp/huggingface_cache \
-  --eval-baseline
-```
-
-Each script run executes exactly one evaluation. Without `--eval-baseline`, the
-script evaluates the fine-tuned model. With `--eval-baseline`, it evaluates the
-base model and writes `baseline-result-25shot.json` by default.
-
-To use FlashAttention after installing it:
-
-```bash
-python run_mistral_arc_experiment.py \
-  --cache-dir /tmp/huggingface_cache \
-  --attn-implementation flash_attention_2
-```
-
-To train only and skip evaluation:
-
-```bash
-python run_mistral_arc_experiment.py --no-run-eval
-```
-
-To evaluate an already saved local model or Hugging Face model:
-
-```bash
-python run_mistral_arc_experiment.py \
-  --eval-only \
-  --eval-model-id /tmp/huggingface_cache/mistral-7b-qlora-alpaca-sample-0.5k
-```
-
-To evaluate an adapter-only result, `lm_eval` must load both the original
-Mistral backbone and the LoRA adapter. If the backbone is already under
-`/tmp/huggingface_cache/mistralai/Mistral-7B-v0.1`, this is enough:
-
-```bash
-python run_mistral_arc_experiment.py \
-  --cache-dir /tmp/huggingface_cache \
-  --eval-only \
-  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train-adapter
-```
-
-Use `--eval-model-id /path/to/base-mistral` when the backbone lives somewhere
-else, and use `--eval-peft-path /path/to/adapter` when you do not want to use
-`--adapter-output-dir`.
-
-To evaluate only the unfine-tuned baseline:
-
-```bash
-python run_mistral_arc_experiment.py \
-  --cache-dir /tmp/huggingface_cache \
-  --eval-only \
-  --eval-baseline
-```
-
-For baseline evaluation, the script only uses a local base model by default. It
-first checks `/tmp/huggingface_cache/mistralai/Mistral-7B-v0.1`, then existing
-Hugging Face snapshot cache directories under `/tmp/huggingface_cache`. Use
-`--base-local-dir` or `--baseline-eval-model-id` when the local model lives
-somewhere else.
-
-If `lm_eval` fails with an error such as
-`MistralForCausalLM.__init__() got an unexpected keyword argument 'dtype'`,
-omit the evaluation dtype argument:
-
-```bash
-python run_mistral_arc_experiment.py \
   --eval-only \
   --eval-model-id /tmp/huggingface_cache/mistralai/Mistral-7B-v0.1 \
-  --eval-peft-path /tmp/huggingface_cache/mistral-7b-qlora-arc-train-adapter \
-  --eval-dtype none
+  --eval-peft-path /tmp/huggingface_cache/adapters/arc_contrastive_best \
+  --num-fewshot 25
 ```
 
-For error analysis, save per-sample inputs, predictions, references, and
-metrics:
+If `lm_eval` fails because of a `dtype` argument mismatch:
 
 ```bash
-python run_mistral_arc_experiment.py \
-  --eval-only \
-  --eval-model-id /tmp/huggingface_cache/mistralai/Mistral-7B-v0.1 \
-  --eval-peft-path /tmp/huggingface_cache/mistral-7b-qlora-arc-train-adapter \
-  --eval-dtype none \
-  --eval-log-samples
+--eval-dtype none
 ```
 
-With sample logging enabled, the default output directory is
-`/tmp/huggingface_cache/results/arc_challenge/finetuned_adapter/` for adapter
-evaluation. For baseline evaluation it is
-`/tmp/huggingface_cache/results/arc_challenge/baseline/`.
-Inside that directory, `lm_eval` writes the aggregate result plus a task-level
-sample file that can be filtered for correct and incorrect ARC examples.
-
-To evaluate only selected saved checkpoints with 25-shot ARC Challenge:
+Evaluate selected checkpoints:
 
 ```bash
 python run_mistral_arc_experiment.py \
@@ -273,98 +143,40 @@ python run_mistral_arc_experiment.py \
   --eval-only \
   --eval-checkpoints \
   --eval-checkpoint-paths \
-    /tmp/huggingface_cache/results/checkpoint-120 \
-    /tmp/huggingface_cache/results/checkpoint-240 \
+    /tmp/huggingface_cache/runs/arc_contrastive/checkpoint-120 \
+    /tmp/huggingface_cache/runs/arc_contrastive/checkpoint-240 \
   --num-fewshot 25
 ```
 
-Each selected checkpoint directory is evaluated as
-`pretrained=base,peft=checkpoint`. By default, result JSON files and
-`checkpoint_eval_summary.json` are written under:
+## Push To Hugging Face
+
+Push a known-good adapter without running eval:
 
 ```bash
-/tmp/huggingface_cache/results/checkpoint_25shot_eval/
-```
-
-Use `--checkpoint-eval-output-dir /path/to/eval-results` to choose a different
-output directory.
-
-If you intentionally want to evaluate every checkpoint under a directory, omit
-`--eval-checkpoint-paths` and use:
-
-```bash
-python run_mistral_arc_experiment.py \
-  --cache-dir /tmp/huggingface_cache \
-  --eval-only \
-  --eval-checkpoints \
-  --eval-checkpoint-dir /tmp/huggingface_cache/results \
-  --num-fewshot 25
-```
-
-## Optional Hub push
-
-Pushing is disabled by default to avoid accidental uploads. Training runs save
-locally only. To decide based on evaluation results, run `--eval-only` first;
-adding `--push-to-hub` uploads the evaluated artifact after `lm_eval` succeeds.
-For adapter evaluation, the upload contains adapter/tokenizer files and skips
-local resume state such as optimizer/scheduler/RNG files:
-
-```bash
-HF_TOKEN=your_token_here python run_mistral_arc_experiment.py \
-  --cache-dir /tmp/huggingface_cache \
-  --eval-only \
-  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train-adapter \
-  --hub-model-id your-hf-id/mistral-7b-qlora-arc-train-adapter \
-  --push-to-hub
-```
-
-If you already know which fine-tuned adapter is best and do not want to run
-`lm_eval`, use `--push-only`:
-
-```bash
-HF_TOKEN=your_token_here python run_mistral_arc_experiment.py \
+HF_TOKEN=hf_your_token python run_mistral_arc_experiment.py \
   --cache-dir /tmp/huggingface_cache \
   --push-only \
-  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train-adapter \
-  --hub-model-id your-hf-id/mistral-7b-qlora-arc-train-adapter \
+  --adapter-output-dir /tmp/huggingface_cache/adapters/arc_contrastive_best \
+  --hub-model-id your-hf-id/mistral-7b-arc-contrastive-adapter \
   --push-to-hub
 ```
 
-To evaluate an adapter, save a full merged model locally, and push that merged
-model instead:
+Merge the adapter into the base model and push a full model:
 
 ```bash
-HF_TOKEN=your_token_here python run_mistral_arc_experiment.py \
-  --cache-dir /tmp/huggingface_cache \
-  --eval-only \
-  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train-adapter \
-  --save-merged-model \
-  --merged-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train-merged \
-  --hub-model-id your-hf-id/mistral-7b-qlora-arc-train-merged \
-  --push-to-hub
-```
-
-Omit `--push-to-hub` from the command above if you only want to evaluate and
-save the merged model locally.
-
-To skip evaluation and directly merge/push a known-good adapter:
-
-```bash
-HF_TOKEN=your_token_here python run_mistral_arc_experiment.py \
+HF_TOKEN=hf_your_token python run_mistral_arc_experiment.py \
   --cache-dir /tmp/huggingface_cache \
   --push-only \
-  --adapter-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train-adapter \
+  --adapter-output-dir /tmp/huggingface_cache/adapters/arc_contrastive_best \
   --save-merged-model \
-  --merged-output-dir /tmp/huggingface_cache/mistral-7b-qlora-arc-train-merged \
-  --hub-model-id your-hf-id/mistral-7b-qlora-arc-train-merged \
+  --merged-output-dir /tmp/huggingface_cache/merged/arc_contrastive \
+  --hub-model-id your-hf-id/mistral-7b-arc-contrastive-merged \
   --push-to-hub
 ```
 
 ## Choice Similarity Analysis
 
-Use `analyze_choice_similarity.py` to compare how semantically similar answer
-choices are within each multiple-choice question for ARC, SciQA, and
-OpenBookQA:
+Analyze cosine similarity among answer choices for ARC, SciQA, and OpenBookQA:
 
 ```bash
 python analyze_choice_similarity.py \
@@ -374,24 +186,20 @@ python analyze_choice_similarity.py \
   --splits train test
 ```
 
-The script embeds unique answer choice texts once with
-`sentence-transformers/all-MiniLM-L6-v2`, computes pairwise cosine similarity
-within each question, and writes:
-
-- `choice_similarity_records.csv` with per-question similarity statistics.
-- `choice_similarity_summary.json` with dataset/split summary statistics.
-- `dataset_comparison.png` comparing all datasets at a glance.
-- `{dataset}_train_test_similarity.png` comparing train/test for each dataset.
-
-For a quick smoke test, add `--sample-size 200`. To save every individual
-choice-pair cosine value, add `--save-pairwise-csv`.
-
-## Useful A100 options
-
-The script follows the notebook's auto precision behavior. On A100 it uses bf16
-by default. To force a specific mode:
+Quick smoke test:
 
 ```bash
-python run_mistral_arc_experiment.py --precision bf16
-python run_mistral_arc_experiment.py --precision fp16
+python analyze_choice_similarity.py \
+  --cache-dir /tmp/huggingface_cache \
+  --output-dir /tmp/huggingface_cache/choice_similarity_smoke \
+  --sample-size 200
 ```
+
+Outputs:
+
+- `choice_similarity_records.csv`
+- `choice_similarity_summary.json`
+- `dataset_comparison.png`
+- `arc_train_test_similarity.png`
+- `sciqa_train_test_similarity.png`
+- `openbookqa_train_test_similarity.png`
